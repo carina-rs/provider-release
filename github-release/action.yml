@@ -1,0 +1,24 @@
+name: Create GitHub Release
+description: Download provider artifacts and attach them to a GitHub release
+
+inputs:
+  provider:
+    description: Artifact prefix, such as carina-provider-aws
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Download release artifacts
+      uses: actions/download-artifact@v4
+      with:
+        pattern: ${{ inputs.provider }}-*
+        merge-multiple: true
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v2
+      with:
+        files: |
+          ${{ inputs.provider }}-*.wasm
+          ${{ inputs.provider }}-*-docs.tar.gz
+        generate_release_notes: true
