@@ -29,7 +29,7 @@ jobs:
 
       - name: Run ShellCheck
         run: |
-          shellcheck scripts/*.sh
+          shellcheck scripts/*.sh tests/*.sh
           ruby -ryaml -ropen3 <<'RUBY'
           failed = false
           %w[github-release/action.yml publish/action.yml yank/action.yml].each do |path|
@@ -50,3 +50,6 @@ jobs:
           end
           exit 1 if failed
           RUBY
+
+      - name: Run registry request tests
+        run: bash tests/registry-request.test.sh
