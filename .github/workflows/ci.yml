@@ -52,4 +52,5 @@ jobs:
           RUBY
 
       - name: Run registry request tests
+        timeout-minutes: 5
         run: bash tests/registry-request.test.sh

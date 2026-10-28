@@ -122,7 +122,15 @@ printf '%s\n' "$max_time" >> "$state_dir/token-max-times"
 printf '%s\n' "$connect_timeout" >> "$state_dir/token-connect-timeouts"
 result=$(sequence_value "$state_dir/token-results" "$count")
 case "$result" in
-  ok)
+  ok|ok+*)
+    if [ "$result" != ok ]; then
+      advance_seconds=${result#ok+}
+      if [[ ! $advance_seconds =~ ^[0-9]+$ ]]; then
+        printf 'unsupported token clock advance: %s\n' "$advance_seconds" >&2
+        exit 2
+      fi
+      printf '%s\n' "$((started_at + advance_seconds))" > "$clock_file"
+    fi
     printf '{"value":"token-%s"}\n' "$count"
     ;;
   fail)
@@ -477,6 +485,59 @@ test_token_failure_retries() {
   assert_contains "$RUN_OUTPUT" 'Publish attempt 2 returned HTTP 201' 'next overall attempt succeeds' || return 1
 }
 
+test_token_fetch_past_deadline_prevents_post() {
+  local payload
+  local deadline=$((EARLY_CERT_EPOCH - 120))
+  local initial_time=$((deadline - 1))
+
+  payload=$(main_bundle_payload "$EARLY_CERT_RAW") || return 1
+  prepare_case "$initial_time" 201
+  set_token_results ok+60
+  run_registry_request Publish "$payload"
+
+  assert_equal 1 "$RUN_STATUS" 'token fetch that crosses the deadline fails' || return 1
+  assert_equal 1 "$(line_count "$CASE_DIR/token-starts")" 'pre-loop deadline check allowed the token request' || return 1
+  assert_equal "$initial_time" "$(< "$CASE_DIR/token-starts")" 'token request started one second before the deadline' || return 1
+  assert_equal 0 "$(line_count "$CASE_DIR/post-starts")" 'post-token deadline check prevents POST' || return 1
+  assert_equal 0 "$(line_count "$CASE_DIR/sleeps")" 'post-token deadline failure does not retry' || return 1
+  assert_contains "$RUN_OUTPUT" 'last status: deadline reached after OIDC token fetch' \
+    'failure identifies the post-token deadline check' || return 1
+}
+
+test_retry_attempt_can_start_at_deadline() {
+  local payload
+  local deadline=$((EARLY_CERT_EPOCH - 120))
+  local initial_time=$((deadline - 10))
+
+  payload=$(main_bundle_payload "$EARLY_CERT_RAW") || return 1
+  prepare_case "$initial_time" 429 201
+  run_registry_request Publish "$payload"
+
+  assert_equal 0 "$RUN_STATUS" 'retry landing exactly on the deadline succeeds' || return 1
+  assert_equal "$initial_time" "$(head -n 1 "$CASE_DIR/post-starts")" 'first attempt starts before the deadline' || return 1
+  assert_equal "$deadline" "$(tail -n 1 "$CASE_DIR/post-starts")" 'second attempt starts exactly at the deadline' || return 1
+  assert_equal 2 "$(line_count "$CASE_DIR/post-starts")" 'exact-deadline retry makes the second POST' || return 1
+  assert_equal 10 "$(< "$CASE_DIR/sleeps")" 'retry sleep may end exactly at the deadline' || return 1
+  assert_contains "$RUN_OUTPUT" 'Publish attempt 2 returned HTTP 201' 'exact-deadline attempt succeeds' || return 1
+}
+
+test_transport_deadline_warns_before_rerun() {
+  local payload
+  local deadline=$((EARLY_CERT_EPOCH - 120))
+
+  payload=$(main_bundle_payload "$EARLY_CERT_RAW") || return 1
+  prepare_case "$deadline" 000
+  run_registry_request Publish "$payload"
+
+  assert_equal 1 "$RUN_STATUS" 'transport error at the deadline fails' || return 1
+  assert_equal 1 "$(line_count "$CASE_DIR/post-starts")" 'transport error at the deadline is not retried' || return 1
+  assert_equal 0 "$(line_count "$CASE_DIR/sleeps")" 'transport error at the deadline does not sleep' || return 1
+  assert_contains "$RUN_OUTPUT" 'last status: 000' 'deadline failure reports the transport status' || return 1
+  assert_contains "$RUN_OUTPUT" \
+    'The last attempt may have committed on the registry; check whether the version is listed before re-running, since a rerun needs a fresh signature.' \
+    'transport deadline failure warns about an ambiguous commit' || return 1
+}
+
 test_docs_earlier_not_after_sets_deadline() {
   local payload
   local deadline=$((EARLY_CERT_EPOCH - 120))
@@ -614,6 +675,9 @@ run_test '400 fails after one POST' test_400_fails_immediately
 run_test '409 fails after one POST' test_409_fails_immediately
 run_test '200 is successful' test_200_succeeds
 run_test 'OIDC token failures are retried with a fresh token' test_token_failure_retries
+run_test 'a token fetch crossing the deadline prevents POST' test_token_fetch_past_deadline_prevents_post
+run_test 'a retry attempt may start exactly at the deadline' test_retry_attempt_can_start_at_deadline
+run_test 'a deadline after HTTP 000 warns before re-running' test_transport_deadline_warns_before_rerun
 run_test 'the earlier docs certificate controls the deadline' test_docs_earlier_not_after_sets_deadline
 run_test 'a missing leaf certificate fails before any request' test_missing_certificate_fails_before_post
 run_test 'an unparseable leaf certificate fails before any request' test_unparseable_certificate_fails_before_post

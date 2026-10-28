@@ -12,6 +12,13 @@ now() {
   date +%s
 }
 
+can_start_by() {
+  local deadline=$1
+  local candidate_time=$2
+
+  [ "$candidate_time" -le "$deadline" ]
+}
+
 certificate_date_to_epoch() {
   local certificate_date=$1
   local timestamp
@@ -98,6 +105,10 @@ wait_then_advance_backoff() {
   if [ "$sleep_time" -gt "$remaining_time" ]; then
     sleep_time=$remaining_time
   fi
+  if [ "$sleep_time" -le 0 ] \
+    || ! can_start_by "$deadline" "$((current_time + sleep_time))"; then
+    return 1
+  fi
   sleep "$sleep_time" || return 1
 
   next_backoff=$((requested_sleep + RETRY_BACKOFF_STEP_SECONDS))
@@ -123,6 +134,9 @@ print_deadline_failure() {
   fi
   printf '%s failed after %s attempts (last status: %s); retry deadline %s exists because it is %s\n' \
     "$operation" "$attempts" "$last_status" "$deadline_iso" "$deadline_reason" >&2
+  if [ "$last_status" = 000 ]; then
+    printf 'The last attempt may have committed on the registry; check whether the version is listed before re-running, since a rerun needs a fresh signature.\n' >&2
+  fi
 }
 
 validate_release_tag() {
@@ -202,7 +216,7 @@ registry_request() {
   # Retry only while an attempt can start by the operation-specific deadline.
   while :; do
     current_time=$(now)
-    if [ "$current_time" -gt "$deadline" ]; then
+    if ! can_start_by "$deadline" "$current_time"; then
       print_deadline_failure "$operation" "$attempt" "$last_status" "$deadline" "$deadline_reason"
       exit 1
     fi
@@ -224,7 +238,7 @@ registry_request() {
     fi
 
     current_time=$(now)
-    if [ "$current_time" -gt "$deadline" ]; then
+    if ! can_start_by "$deadline" "$current_time"; then
       last_status='deadline reached after OIDC token fetch'
       print_deadline_failure "$operation" "$attempt" "$last_status" "$deadline" "$deadline_reason"
       exit 1
