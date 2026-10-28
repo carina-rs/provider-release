@@ -14,6 +14,11 @@ CASE_NUMBER=0
 FAILURES=0
 RUN_STATUS=0
 RUN_OUTPUT=
+PUBLISH_DEADLINE_HINT='Re-run only the failed publish job; it re-signs with fresh certificates. If the earlier attempt fully committed, the rerun gets 200 because the bytes are unchanged. If it was interrupted after the registry recorded the artifact signature but not the docs signature, the rerun gets 409 docs_signer_mismatch_recorded; publish a new version instead.'
+CONFIG_HINT=$'Hint: check release-tag-environment mode, environment `release`, and that the trusted-publisher policy points at the caller\'s .github/workflows/release.yml.'
+VERSION_CONFLICT_HINT='Hint: the version exists with different bytes (often because a whole-workflow rerun rebuilt the docs); only a new version fixes it now.'
+DOCS_SIGNER_MISMATCH_HINT='Hint: a previous attempt was interrupted after recording the artifact signature; this version cannot get docs, so publish a new version.'
+GENERIC_409_HINT='Hint: the version exists with different bytes; only a new version fixes it now.'
 
 cleanup() {
   rm -rf -- "$TEST_ROOT"
@@ -113,7 +118,12 @@ if $is_post; then
   printf '%s\n' "$authorization" >> "$state_dir/post-authorizations"
   printf '%s\n' "$request_url" >> "$state_dir/post-urls"
   result=$(sequence_value "$state_dir/post-results" "$count")
-  printf 'response-%s-attempt-%s\n' "$result" "$count" > "$response_file"
+  if [ -f "$state_dir/post-response-body" ]; then
+    response_body=$(< "$state_dir/post-response-body")
+    printf '%s\n' "$response_body" > "$response_file"
+  else
+    printf 'response-%s-attempt-%s\n' "$result" "$count" > "$response_file"
+  fi
   if [ "$result" = 000 ]; then
     printf '000'
     exit 7
@@ -292,6 +302,10 @@ set_token_results() {
   printf '%s\n' "$@" > "$CASE_DIR/token-results"
 }
 
+set_post_response_body() {
+  printf '%s\n' "$1" > "$CASE_DIR/post-response-body"
+}
+
 run_registry_request() {
   local operation=$1
   local payload=$2
@@ -309,6 +323,18 @@ run_registry_request() {
     REGISTRY_YANK_URL=https://registry.example.test/yank \
     bash "$REGISTRY_REQUEST" request "$operation" "$payload" 2>&1)
   RUN_STATUS=$?
+}
+
+run_publish_error_response() {
+  local status=$1
+  local response_body=$2
+  local payload
+  local initial_time=$((EARLY_CERT_EPOCH - 120 - 300))
+
+  payload=$(main_bundle_payload "$EARLY_CERT_RAW") || return 1
+  prepare_case "$initial_time" "$status"
+  set_post_response_body "$response_body"
+  run_registry_request Publish "$payload"
 }
 
 line_count() {
@@ -432,8 +458,7 @@ test_deadline_stops_429_retries() {
   assert_contains "$RUN_OUTPUT" "$deadline_iso" 'failure states UTC deadline' || return 1
   assert_contains "$RUN_OUTPUT" 'notAfter' 'failure explains certificate deadline' || return 1
   assert_contains "$RUN_OUTPUT" '120' 'failure explains verification margin' || return 1
-  assert_contains "$RUN_OUTPUT" \
-    'Re-run the failed publish job: it signs again with fresh certificates. If an earlier attempt already committed, the registry answers the rerun with 200 because the artifact is unchanged.' \
+  assert_contains "$RUN_OUTPUT" "$PUBLISH_DEADLINE_HINT" \
     'publish deadline failure explains how to retry safely' || return 1
   assert_not_contains "$RUN_OUTPUT" 'The last attempt may have committed on the registry.' \
     '429 does not imply an ambiguous registry commit' || return 1
@@ -467,45 +492,136 @@ test_400_fails_immediately() {
   assert_equal 0 "$(line_count "$CASE_DIR/sleeps")" '400 does not sleep' || return 1
 }
 
-test_403_prints_trusted_publisher_hint() {
-  local payload
-  local initial_time=$((EARLY_CERT_EPOCH - 120 - 300))
-  local expected_hint
+assert_publish_error_hint() {
+  local expected_hint=$1
+  local context=$2
 
-  expected_hint=$'Hint: check release-tag-environment mode, environment `release`, and that the trusted-publisher policy points at the caller\'s .github/workflows/release.yml.'
-  payload=$(main_bundle_payload "$EARLY_CERT_RAW") || return 1
-
-  prepare_case "$initial_time" 403
-  run_registry_request Publish "$payload"
-
-  assert_equal 1 "$RUN_STATUS" 'publish 403 fails' || return 1
-  assert_equal 1 "$(line_count "$CASE_DIR/post-starts")" 'publish 403 is not retried' || return 1
-  assert_contains "$RUN_OUTPUT" "$expected_hint" 'publish 403 explains the trusted-publisher checks' || return 1
-  assert_equal 1 "$(grep -c '^Hint:' <<< "$RUN_OUTPUT")" 'publish 403 prints one hint line' || return 1
-
-  prepare_case "$initial_time" 403
-  run_registry_request Yank '{}'
-
-  assert_equal 1 "$RUN_STATUS" 'yank 403 fails' || return 1
-  assert_equal 1 "$(line_count "$CASE_DIR/post-starts")" 'yank 403 is not retried' || return 1
-  assert_contains "$RUN_OUTPUT" "$expected_hint" 'yank 403 explains the trusted-publisher checks' || return 1
-  assert_equal 1 "$(grep -c '^Hint:' <<< "$RUN_OUTPUT")" 'yank 403 prints one hint line' || return 1
+  assert_equal 1 "$RUN_STATUS" "$context fails" || return 1
+  assert_equal 1 "$(line_count "$CASE_DIR/post-starts")" "$context is not retried" || return 1
+  assert_equal 0 "$(line_count "$CASE_DIR/sleeps")" "$context does not sleep" || return 1
+  assert_contains "$RUN_OUTPUT" "$expected_hint" "$context prints the expected hint" || return 1
+  assert_equal 1 "$(grep -c '^Hint:' <<< "$RUN_OUTPUT")" "$context prints one hint line"
 }
 
-test_publish_409_prints_content_conflict_hint() {
-  local payload
-  local initial_time=$((EARLY_CERT_EPOCH - 120 - 300))
+test_403_provider_frozen_hint() {
+  run_publish_error_response 403 \
+    '{"error":"provider_frozen","detail":"provider_tombstoned","message":"version_forbidden"}' || return 1
 
-  payload=$(main_bundle_payload "$EARLY_CERT_RAW") || return 1
-  prepare_case "$initial_time" 409 201
-  run_registry_request Publish "$payload"
+  assert_publish_error_hint \
+    'Hint: not a config problem: the provider is frozen pending registry-operator review.' \
+    'provider_frozen 403' || return 1
+  assert_not_contains "$RUN_OUTPUT" "$CONFIG_HINT" \
+    'provider_frozen does not print the config hint' || return 1
+}
 
-  assert_equal 1 "$RUN_STATUS" '409 remains a conflict' || return 1
-  assert_equal 1 "$(line_count "$CASE_DIR/post-starts")" '409 is not retried' || return 1
-  assert_equal 0 "$(line_count "$CASE_DIR/sleeps")" '409 does not sleep' || return 1
-  assert_contains "$RUN_OUTPUT" \
-    'Hint: the version already exists with different content; re-running the whole workflow rebuilds docs with a new digest — re-run only the failed job, or publish a new version.' \
-    'publish 409 explains how to avoid rebuilding docs with a new digest' || return 1
+test_403_provider_tombstoned_hint() {
+  run_publish_error_response 403 \
+    '{"error":"provider_tombstoned","detail":"provider_frozen"}' || return 1
+
+  assert_publish_error_hint \
+    'Hint: the name is permanently closed.' \
+    'provider_tombstoned 403' || return 1
+  assert_not_contains "$RUN_OUTPUT" 'the provider is frozen' \
+    'provider_tombstoned ignores the detail field' || return 1
+}
+
+test_403_version_forbidden_hint() {
+  run_publish_error_response 403 \
+    '{"error":"version_forbidden","detail":"provider_frozen"}' || return 1
+
+  assert_publish_error_hint \
+    'Hint: the tag must be exactly v<version>.' \
+    'version_forbidden 403' || return 1
+  assert_not_contains "$RUN_OUTPUT" 'the provider is frozen' \
+    'version_forbidden ignores the detail field' || return 1
+}
+
+test_403_claim_mismatch_hint() {
+  run_publish_error_response 403 \
+    '{"error":"claim_mismatch","detail":"provider_frozen"}' || return 1
+
+  assert_publish_error_hint "$CONFIG_HINT" 'claim_mismatch 403' || return 1
+  assert_not_contains "$RUN_OUTPUT" 'the provider is frozen' \
+    'claim_mismatch ignores the detail field' || return 1
+}
+
+test_403_unknown_code_falls_back() {
+  run_publish_error_response 403 \
+    '{"error":"future_registry_error","detail":"provider_frozen","message":"provider_tombstoned"}' || return 1
+
+  assert_publish_error_hint "$CONFIG_HINT" 'unknown-code 403' || return 1
+  assert_not_contains "$RUN_OUTPUT" 'the provider is frozen' \
+    'unknown 403 ignores detail and message fields' || return 1
+}
+
+test_403_missing_error_falls_back() {
+  run_publish_error_response 403 \
+    '{"detail":"provider_frozen","message":"provider_tombstoned"}' || return 1
+
+  assert_publish_error_hint "$CONFIG_HINT" 'missing-error 403' || return 1
+  assert_not_contains "$RUN_OUTPUT" 'the provider is frozen' \
+    '403 without .error ignores detail and message fields' || return 1
+}
+
+test_403_non_json_falls_back() {
+  run_publish_error_response 403 \
+    'provider_frozen: response was not JSON' || return 1
+
+  assert_publish_error_hint "$CONFIG_HINT" 'non-JSON 403' || return 1
+  assert_not_contains "$RUN_OUTPUT" 'the provider is frozen pending registry-operator review' \
+    'non-JSON 403 does not infer an error code from text' || return 1
+}
+
+test_409_version_conflict_hint() {
+  run_publish_error_response 409 \
+    '{"error":"version_conflict","detail":"docs_signer_mismatch_recorded"}' || return 1
+
+  assert_publish_error_hint "$VERSION_CONFLICT_HINT" 'version_conflict 409' || return 1
+  assert_not_contains "$RUN_OUTPUT" 'a previous attempt was interrupted' \
+    'version_conflict ignores the detail field' || return 1
+}
+
+test_409_docs_signer_mismatch_hint() {
+  run_publish_error_response 409 \
+    '{"error":"docs_signer_mismatch_recorded","detail":"version_conflict"}' || return 1
+
+  assert_publish_error_hint "$DOCS_SIGNER_MISMATCH_HINT" \
+    'docs_signer_mismatch_recorded 409' || return 1
+  assert_not_contains "$RUN_OUTPUT" 'whole-workflow rerun rebuilt the docs' \
+    'docs_signer_mismatch_recorded ignores the detail field' || return 1
+}
+
+test_409_unknown_code_falls_back() {
+  run_publish_error_response 409 \
+    '{"error":"future_registry_error","detail":"version_conflict","message":"docs_signer_mismatch_recorded"}' || return 1
+
+  assert_publish_error_hint "$GENERIC_409_HINT" 'unknown-code 409' || return 1
+  assert_not_contains "$RUN_OUTPUT" 'whole-workflow rerun rebuilt the docs' \
+    'unknown 409 ignores the detail field' || return 1
+  assert_not_contains "$RUN_OUTPUT" 'a previous attempt was interrupted' \
+    'unknown 409 ignores the message field' || return 1
+}
+
+test_409_missing_error_falls_back() {
+  run_publish_error_response 409 \
+    '{"detail":"version_conflict","message":"docs_signer_mismatch_recorded"}' || return 1
+
+  assert_publish_error_hint "$GENERIC_409_HINT" 'missing-error 409' || return 1
+  assert_not_contains "$RUN_OUTPUT" 'whole-workflow rerun rebuilt the docs' \
+    '409 without .error ignores the detail field' || return 1
+  assert_not_contains "$RUN_OUTPUT" 'a previous attempt was interrupted' \
+    '409 without .error ignores the message field' || return 1
+}
+
+test_409_non_json_falls_back() {
+  run_publish_error_response 409 \
+    'version_conflict docs_signer_mismatch_recorded: response was not JSON' || return 1
+
+  assert_publish_error_hint "$GENERIC_409_HINT" 'non-JSON 409' || return 1
+  assert_not_contains "$RUN_OUTPUT" 'whole-workflow rerun rebuilt the docs' \
+    'non-JSON 409 does not infer version_conflict from text' || return 1
+  assert_not_contains "$RUN_OUTPUT" 'a previous attempt was interrupted' \
+    'non-JSON 409 does not infer docs_signer_mismatch_recorded from text' || return 1
 }
 
 test_yank_409_omits_publish_content_conflict_hint() {
@@ -516,8 +632,8 @@ test_yank_409_omits_publish_content_conflict_hint() {
 
   assert_equal 1 "$RUN_STATUS" 'yank 409 fails' || return 1
   assert_equal 1 "$(line_count "$CASE_DIR/post-starts")" 'yank 409 is not retried' || return 1
-  assert_not_contains "$RUN_OUTPUT" 'the version already exists with different content' \
-    'yank 409 does not print the publish-only content conflict hint' || return 1
+  assert_not_contains "$RUN_OUTPUT" 'Hint:' \
+    'yank 409 does not print a publish-only hint' || return 1
 }
 
 test_200_succeeds() {
@@ -598,8 +714,7 @@ test_transport_deadline_warns_before_rerun() {
   assert_equal 1 "$(line_count "$CASE_DIR/post-starts")" 'transport error at the deadline is not retried' || return 1
   assert_equal 0 "$(line_count "$CASE_DIR/sleeps")" 'transport error at the deadline does not sleep' || return 1
   assert_contains "$RUN_OUTPUT" 'last status: 000' 'deadline failure reports the transport status' || return 1
-  assert_contains "$RUN_OUTPUT" \
-    'Re-run the failed publish job: it signs again with fresh certificates. If an earlier attempt already committed, the registry answers the rerun with 200 because the artifact is unchanged.' \
+  assert_contains "$RUN_OUTPUT" "$PUBLISH_DEADLINE_HINT" \
     'transport deadline failure explains how to retry the publish' || return 1
   assert_contains "$RUN_OUTPUT" \
     'The last attempt may have committed on the registry.' \
@@ -619,8 +734,7 @@ test_publish_5xx_deadline_warns_about_ambiguous_commit() {
   assert_equal 1 "$RUN_STATUS" 'publish 5xx at the deadline fails' || return 1
   assert_equal 1 "$(line_count "$CASE_DIR/post-starts")" 'publish 5xx at the deadline is not retried' || return 1
   assert_contains "$RUN_OUTPUT" 'last status: 503' 'deadline failure reports the 5xx status' || return 1
-  assert_contains "$RUN_OUTPUT" \
-    'Re-run the failed publish job: it signs again with fresh certificates. If an earlier attempt already committed, the registry answers the rerun with 200 because the artifact is unchanged.' \
+  assert_contains "$RUN_OUTPUT" "$PUBLISH_DEADLINE_HINT" \
     '5xx deadline failure explains how to retry the publish' || return 1
   assert_contains "$RUN_OUTPUT" 'The last attempt may have committed on the registry.' \
     'publish 5xx deadline failure warns about an ambiguous commit' || return 1
@@ -718,8 +832,7 @@ test_expired_publish_deadline_fails_before_attempt() {
   assert_equal 0 "$(line_count "$CASE_DIR/token-starts")" 'past deadline prevents token request' || return 1
   assert_contains "$RUN_OUTPUT" 'notAfter' 'past-deadline error names notAfter' || return 1
   assert_contains "$RUN_OUTPUT" "$not_after_iso" 'past-deadline error names certificate expiry' || return 1
-  assert_contains "$RUN_OUTPUT" \
-    'Re-run the failed publish job: it signs again with fresh certificates. If an earlier attempt already committed, the registry answers the rerun with 200 because the artifact is unchanged.' \
+  assert_contains "$RUN_OUTPUT" "$PUBLISH_DEADLINE_HINT" \
     'zero-attempt publish deadline failure still explains what to do' || return 1
   assert_not_contains "$RUN_OUTPUT" 'The last attempt may have committed on the registry.' \
     'zero-attempt publish failure does not imply an ambiguous commit' || return 1
@@ -829,8 +942,18 @@ run_test '429 uses capped backoff and can reach 201' test_429_backoff_then_201
 run_test '429 retries stop at the certificate deadline' test_deadline_stops_429_retries
 run_test '5xx and transport errors are retried' test_5xx_and_transport_errors_retry
 run_test '400 fails after one POST' test_400_fails_immediately
-run_test '403 prints trusted-publisher guidance for both operations' test_403_prints_trusted_publisher_hint
-run_test 'Publish 409 explains the content conflict' test_publish_409_prints_content_conflict_hint
+run_test '403 provider_frozen prints the registry-operator hint' test_403_provider_frozen_hint
+run_test '403 provider_tombstoned prints the permanently-closed hint' test_403_provider_tombstoned_hint
+run_test '403 version_forbidden prints the exact-tag hint' test_403_version_forbidden_hint
+run_test '403 claim_mismatch prints trusted-publisher guidance' test_403_claim_mismatch_hint
+run_test '403 unknown error code uses the status-only hint' test_403_unknown_code_falls_back
+run_test '403 JSON without .error uses the status-only hint' test_403_missing_error_falls_back
+run_test '403 non-JSON response uses the status-only hint' test_403_non_json_falls_back
+run_test '409 version_conflict explains rebuilt bytes' test_409_version_conflict_hint
+run_test '409 docs_signer_mismatch_recorded explains the interrupted publish' test_409_docs_signer_mismatch_hint
+run_test '409 unknown error code uses the status-only hint' test_409_unknown_code_falls_back
+run_test '409 JSON without .error uses the status-only hint' test_409_missing_error_falls_back
+run_test '409 non-JSON response uses the status-only hint' test_409_non_json_falls_back
 run_test 'Yank 409 omits the publish content-conflict hint' test_yank_409_omits_publish_content_conflict_hint
 run_test '200 is successful' test_200_succeeds
 run_test 'OIDC token failures are retried with a fresh token' test_token_failure_retries

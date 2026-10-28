@@ -77,6 +77,9 @@ runs:
     - name: Publish to Carina Registry
       # If publishing fails, re-run only this failed job. Re-running the whole workflow
       # rebuilds docs with a different digest, which the registry rejects with a 409.
+      # If an attempt was interrupted after the registry recorded the artifact signature
+      # but not the docs signature, the rerun gets 409 docs_signer_mismatch_recorded;
+      # publish a new version instead.
       # For a 403 claim_mismatch, verify release-tag-environment mode and environment
       # `release`. The trusted-publisher policy must point at the CALLER's
       # .github/workflows/release.yml.

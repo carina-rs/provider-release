@@ -137,7 +137,7 @@ print_deadline_failure() {
 
   case "$operation" in
     Publish)
-      printf 'Re-run the failed publish job: it signs again with fresh certificates. If an earlier attempt already committed, the registry answers the rerun with 200 because the artifact is unchanged.\n' >&2
+      printf 'Re-run only the failed publish job; it re-signs with fresh certificates. If the earlier attempt fully committed, the rerun gets 200 because the bytes are unchanged. If it was interrupted after the registry recorded the artifact signature but not the docs signature, the rerun gets 409 docs_signer_mismatch_recorded; publish a new version instead.\n' >&2
       ;;
     Yank)
       printf 'Re-run the failed yank job; yanking an already-yanked version succeeds.\n' >&2
@@ -180,6 +180,7 @@ registry_request() {
   local last_status='not attempted'
   local token
   local status
+  local error_code
 
   operation_started_at=$(now)
 
@@ -274,6 +275,11 @@ registry_request() {
     sed 's/^/  /' "$response_file"
     printf '\n'
     last_status=$status
+    error_code=
+    if ! error_code=$(jq -er '.error | select(type == "string" and length > 0)' \
+      "$response_file" 2>/dev/null); then
+      error_code=
+    fi
 
     case "$status" in
       200|201)
@@ -288,13 +294,37 @@ registry_request() {
         ;;
       403)
         printf '%s failed with non-retryable status %s\n' "$operation" "$status" >&2
-        printf "Hint: check release-tag-environment mode, environment \`release\`, and that the trusted-publisher policy points at the caller's .github/workflows/release.yml.\n" >&2
+        case "$error_code" in
+          provider_frozen)
+            printf 'Hint: not a config problem: the provider is frozen pending registry-operator review.\n' >&2
+            ;;
+          provider_tombstoned)
+            printf 'Hint: the name is permanently closed.\n' >&2
+            ;;
+          version_forbidden)
+            printf 'Hint: the tag must be exactly v<version>.\n' >&2
+            ;;
+          # claim_mismatch, missing .error, and unknown codes retain the config hint.
+          *)
+            printf "Hint: check release-tag-environment mode, environment \`release\`, and that the trusted-publisher policy points at the caller's .github/workflows/release.yml.\n" >&2
+            ;;
+        esac
         exit 1
         ;;
       409)
         printf '%s failed with non-retryable status %s\n' "$operation" "$status" >&2
         if [ "$operation" = Publish ]; then
-          printf 'Hint: the version already exists with different content; re-running the whole workflow rebuilds docs with a new digest — re-run only the failed job, or publish a new version.\n' >&2
+          case "$error_code" in
+            version_conflict)
+              printf 'Hint: the version exists with different bytes (often because a whole-workflow rerun rebuilt the docs); only a new version fixes it now.\n' >&2
+              ;;
+            docs_signer_mismatch_recorded)
+              printf 'Hint: a previous attempt was interrupted after recording the artifact signature; this version cannot get docs, so publish a new version.\n' >&2
+              ;;
+            *)
+              printf 'Hint: the version exists with different bytes; only a new version fixes it now.\n' >&2
+              ;;
+          esac
         fi
         exit 1
         ;;
