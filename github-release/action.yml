@@ -1,0 +1,30 @@
+name: Create GitHub Release
+description: Download provider artifacts and attach them to a GitHub release
+
+inputs:
+  provider:
+    description: Artifact prefix, such as carina-provider-aws
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Download WASM Artifact
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      with:
+        name: ${{ inputs.provider }}-wasm
+        path: .
+
+    - name: Download Docs Artifact
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      with:
+        name: ${{ inputs.provider }}-docs
+        path: .
+
+    - name: Create Release
+      uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+      with:
+        files: |
+          ${{ inputs.provider }}-*.wasm
+          ${{ inputs.provider }}-*-docs.tar.gz
+        generate_release_notes: true

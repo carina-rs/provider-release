@@ -1,0 +1,98 @@
+name: Build Provider Artifacts
+
+on:
+  workflow_call:
+    inputs:
+      provider:
+        description: Cargo binary name and artifact prefix
+        required: true
+        type: string
+      wasm-toolchain:
+        description: Rust toolchain used for the WASM build
+        required: false
+        default: stable
+        type: string
+      docs-generate:
+        description: Shell script that generates and verifies provider documentation
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build-wasm:
+    name: Build WASM
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: ${{ inputs.wasm-toolchain }}
+          targets: wasm32-wasip2
+
+      - name: Build
+        env:
+          PROVIDER: ${{ inputs.provider }}
+        run: cargo build --release --target wasm32-wasip2 --bin "$PROVIDER"
+
+      - name: Optimize WASM with vela
+        env:
+          PROVIDER: ${{ inputs.provider }}
+        run: |
+          cargo install --git https://github.com/mizzy/vela --rev 4611418f8a84426b4b79077cae3f59357ca09ff7 vela-cli --quiet
+          vela optimize "target/wasm32-wasip2/release/${PROVIDER}.wasm" -o "target/wasm32-wasip2/release/${PROVIDER}.wasm"
+
+      - name: Package
+        env:
+          PROVIDER: ${{ inputs.provider }}
+        run: |
+          cp -- "target/wasm32-wasip2/release/${PROVIDER}.wasm" "${PROVIDER}-${GITHUB_REF_NAME}.wasm"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ inputs.provider }}-wasm
+          path: ${{ inputs.provider }}-${{ github.ref_name }}.wasm
+
+  build-docs:
+    name: Build Docs Bundle
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+          components: rustfmt
+
+      - name: Generate and verify documentation
+        env:
+          DOCS_GENERATE: ${{ inputs.docs-generate }}
+        run: |
+          # This input is caller-supplied code by design. Materialize it without
+          # expanding it in this shell, then run it with the same `bash -e`
+          # behavior as a normal GitHub Actions `run:` step.
+          script_path=$(mktemp "${RUNNER_TEMP}/docs-generate.XXXXXX")
+          trap 'rm -f "$script_path"' EXIT
+          printf '%s\n' "$DOCS_GENERATE" > "$script_path"
+          bash -e -- "$script_path"
+
+      - name: Build documentation bundle
+        env:
+          PROVIDER: ${{ inputs.provider }}
+        run: |
+          bundle="${PROVIDER}-${GITHUB_REF_NAME}-docs.tar.gz"
+          python3 scripts/docs-bundle.py build "$bundle"
+          python3 scripts/docs-bundle.py check "$bundle"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ inputs.provider }}-docs
+          path: ${{ inputs.provider }}-${{ github.ref_name }}-docs.tar.gz

@@ -1,0 +1,131 @@
+name: Publish to Carina Registry
+description: Sign provider artifacts and publish a release to the Carina registry
+
+inputs:
+  provider:
+    description: Artifact prefix, such as carina-provider-aws
+    required: true
+  name:
+    description: Provider name in the registry, such as aws
+    required: true
+  namespace:
+    description: Provider namespace in the registry, such as carina-rs
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Validate Release Tag
+      id: release_tag
+      shell: bash
+      env:
+        REGISTRY_REQUEST: ${{ github.action_path }}/../scripts/registry-request.sh
+      run: 'bash "$REGISTRY_REQUEST" validate'
+
+    - name: Download WASM Artifact
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      with:
+        name: ${{ inputs.provider }}-wasm
+
+    - name: Download Docs Artifact
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      with:
+        name: ${{ inputs.provider }}-docs
+
+    # Pin v2.6.5: the registry requires Rekor v1's SET; Rekor v2 issues no SET,
+    # and cosign v3 defaults to signing-config, which routes to Rekor v2.
+    - name: Install cosign
+      uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      with:
+        cosign-release: 'v2.6.5'
+
+    # The registry requires the WASM and docs certificates to share the run
+    # invocation URI, so both artifacts must be signed in this job.
+    - name: Sign release artifacts (keyless)
+      shell: bash
+      env:
+        PROVIDER: ${{ inputs.provider }}
+      run: |
+        set -euo pipefail
+
+        sign_blob() {
+          artifact=$1
+          bundle=$2
+          for attempt in 1 2 3; do
+            if cosign sign-blob "$artifact" \
+              --bundle "$bundle" \
+              --new-bundle-format=true \
+              --yes; then
+              return
+            fi
+
+            printf 'Signing %s attempt %s failed\n' "$artifact" "$attempt" >&2
+            if [ "$attempt" -lt 3 ]; then
+              sleep 10
+              continue
+            fi
+            printf 'Signing %s failed after 3 attempts\n' "$artifact" >&2
+            exit 1
+          done
+        }
+
+        # Sign docs first so the WASM certificate stays freshest for the publish retry loop.
+        sign_blob "${PROVIDER}-${GITHUB_REF_NAME}-docs.tar.gz" docs-sigstore-bundle.json
+        sign_blob "${PROVIDER}-${GITHUB_REF_NAME}.wasm" sigstore-bundle.json
+
+    - name: Publish to Carina Registry
+      # If publishing fails, re-run only this failed job. Re-running the whole workflow
+      # rebuilds docs with a different digest, which the registry rejects with a 409.
+      # For a 403 claim_mismatch, verify release-tag-environment mode and environment
+      # `release`. The trusted-publisher policy must point at the CALLER's
+      # .github/workflows/release.yml.
+      shell: bash
+      env:
+        REGISTRY_REQUEST: ${{ github.action_path }}/../scripts/registry-request.sh
+        PROVIDER: ${{ inputs.provider }}
+        PROVIDER_NAME: ${{ inputs.name }}
+        PROVIDER_NAMESPACE: ${{ inputs.namespace }}
+        VERSION: ${{ steps.release_tag.outputs.version }}
+        REGISTRY_AUDIENCE: registry.carina-rs.dev
+        REGISTRY_PUBLISH_URL: https://publish.registry.carina-rs.dev/v1/publish
+      run: |
+        set -euo pipefail
+
+        if ! jq -e 'type == "object"' sigstore-bundle.json >/dev/null; then
+          echo "sigstore-bundle.json is missing or not a JSON object" >&2
+          exit 1
+        fi
+
+        version="${VERSION:?Validate Release Tag did not produce a version}"
+        asset_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/${PROVIDER}-${GITHUB_REF_NAME}.wasm"
+        docs=null
+        if [[ "${version%%+*}" != *-* ]]; then
+          if ! jq -e 'type == "object"' docs-sigstore-bundle.json >/dev/null; then
+            echo "docs-sigstore-bundle.json is missing or not a JSON object" >&2
+            exit 1
+          fi
+
+          docs_asset_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/${PROVIDER}-${GITHUB_REF_NAME}-docs.tar.gz"
+          docs=$(jq -n \
+            --arg asset_url "$docs_asset_url" \
+            --slurpfile bundle docs-sigstore-bundle.json \
+            '{
+              candidate_download_url: $asset_url,
+              sigstore_bundle: $bundle[0]
+            }')
+        fi
+        payload=$(jq -n \
+          --arg namespace "$PROVIDER_NAMESPACE" \
+          --arg name "$PROVIDER_NAME" \
+          --arg version "$version" \
+          --arg asset_url "$asset_url" \
+          --slurpfile bundle sigstore-bundle.json \
+          --argjson docs "$docs" \
+          '{
+            namespace: $namespace,
+            name: $name,
+            version: $version,
+            candidate_download_url: $asset_url,
+            sigstore_bundle: $bundle[0]
+          } + if $docs == null then {} else {docs: $docs} end')
+        bash "$REGISTRY_REQUEST" request Publish "$payload"

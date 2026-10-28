@@ -1,0 +1,44 @@
+name: Yank from Carina Registry
+description: Yank a provider release from the Carina registry
+
+inputs:
+  name:
+    description: Provider name in the registry, such as aws
+    required: true
+  namespace:
+    description: Provider namespace in the registry, such as carina-rs
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Validate Release Tag
+      id: release_tag
+      shell: bash
+      env:
+        REGISTRY_REQUEST: ${{ github.action_path }}/../scripts/registry-request.sh
+      run: 'bash "$REGISTRY_REQUEST" validate'
+
+    - name: Yank from Carina Registry
+      shell: bash
+      env:
+        REGISTRY_REQUEST: ${{ github.action_path }}/../scripts/registry-request.sh
+        PROVIDER_NAME: ${{ inputs.name }}
+        PROVIDER_NAMESPACE: ${{ inputs.namespace }}
+        VERSION: ${{ steps.release_tag.outputs.version }}
+        REGISTRY_AUDIENCE: registry.carina-rs.dev
+        REGISTRY_YANK_URL: https://publish.registry.carina-rs.dev/v1/yank
+      run: |
+        set -euo pipefail
+
+        version="${VERSION:?Validate Release Tag did not produce a version}"
+        payload=$(jq -n \
+          --arg namespace "$PROVIDER_NAMESPACE" \
+          --arg name "$PROVIDER_NAME" \
+          --arg version "$version" \
+          '{
+            namespace: $namespace,
+            name: $name,
+            version: $version
+          }')
+        bash "$REGISTRY_REQUEST" request Yank "$payload"

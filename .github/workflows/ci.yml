@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  actionlint:
+    name: actionlint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install actionlint
+        env:
+          ACTIONLINT_VERSION: v1.7.12
+        run: |
+          mkdir -p "${RUNNER_TEMP}/bin"
+          GOBIN="${RUNNER_TEMP}/bin" go install "github.com/rhysd/actionlint/cmd/actionlint@${ACTIONLINT_VERSION}"
+
+      - name: Run actionlint
+        run: |
+          "${RUNNER_TEMP}/bin/actionlint" .github/workflows/*.yml examples/release.yml
+
+      - name: Run ShellCheck
+        run: |
+          shellcheck scripts/*.sh
+          ruby -ryaml -ropen3 <<'RUBY'
+          failed = false
+          %w[github-release/action.yml publish/action.yml yank/action.yml].each do |path|
+            action = YAML.load_file(path, aliases: true)
+            action.fetch('runs').fetch('steps').each_with_index do |step, index|
+              next unless step['run']
+
+              stdout, stderr, status = Open3.capture3(
+                'shellcheck', '--shell=bash', '-', stdin_data: step.fetch('run')
+              )
+              next if status.success?
+
+              warn "#{path}: run step #{index + 1} failed ShellCheck"
+              warn stdout unless stdout.empty?
+              warn stderr unless stderr.empty?
+              failed = true
+            end
+          end
+          exit 1 if failed
+          RUBY

@@ -1,0 +1,74 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build
+    if: github.event_name == 'push'
+    # replace with a full commit SHA of carina-rs/provider-release
+    uses: carina-rs/provider-release/.github/workflows/build.yml@0000000000000000000000000000000000000000
+    with:
+      provider: carina-provider-example
+      docs-generate: |
+        ./scripts/generate-docs.sh
+        docs_status=$(git status --porcelain -- generated-docs)
+        if ! git diff --exit-code || [ -n "$docs_status" ]; then
+          if [ -n "$docs_status" ]; then
+            printf '%s\n' "$docs_status"
+          fi
+          echo "::error::Generated documentation is stale. Run './scripts/generate-docs.sh' locally and commit the generated files before releasing."
+          exit 1
+        fi
+
+  release:
+    name: Create Release
+    needs: build
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: carina-rs/provider-release/github-release@0000000000000000000000000000000000000000
+        with:
+          provider: carina-provider-example
+
+  publish:
+    name: Publish to Carina Registry
+    needs: release
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      id-token: write
+    steps:
+      - uses: carina-rs/provider-release/publish@0000000000000000000000000000000000000000
+        with:
+          provider: carina-provider-example
+          name: example
+          # Registry namespace that owns this provider.
+          namespace: your-namespace
+
+  yank:
+    name: Yank from Carina Registry
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      id-token: write
+    steps:
+      - uses: carina-rs/provider-release/yank@0000000000000000000000000000000000000000
+        with:
+          name: example
+          # Registry namespace that owns this provider.
+          namespace: your-namespace
