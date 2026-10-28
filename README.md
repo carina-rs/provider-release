@@ -24,10 +24,12 @@ The reusable build workflow therefore has no OIDC permission.
 The provider repository must:
 
 - expose a Cargo binary whose name is the `provider` input;
-- include `scripts/docs-bundle.py`; copy it from
-  [carina-provider-aws](https://github.com/carina-rs/carina-provider-aws/blob/main/scripts/docs-bundle.py),
-  set `GENERATED_DOCS` to your docs directory, and keep its `build <archive>` and
-  `check <archive>` commands. `check` enforces the registry's docs bundle rules;
+- copy
+  [`scripts/docs-bundle.py`](https://github.com/carina-rs/carina-provider-aws/blob/main/scripts/docs-bundle.py),
+  keep its `build <archive>` and `check <archive>` commands, set `GENERATED_DOCS`
+  to your docs directory, and adjust its `generated-docs/aws` error messages. It
+  reads `docs/registry/index.md` as the bundle's index page (provide it or change
+  `INDEX_SOURCE`), while `check` enforces the registry's docs bundle rules;
 - provide `docs-generate`, which generates the docs and should fail when committed
   generated files are stale;
 - define a GitHub environment named `release` and restrict it to `v*` tags; and
