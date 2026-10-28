@@ -34,6 +34,7 @@ response_file=
 max_time=
 connect_timeout=
 authorization=
+request_url=
 
 printf '%q ' "$@" >> "$state_dir/curl-arguments"
 printf '\n' >> "$state_dir/curl-arguments"
@@ -63,6 +64,10 @@ while [ "$#" -gt 0 ]; do
         authorization=${2-}
       fi
       shift 2
+      ;;
+    http://*|https://*)
+      request_url=$1
+      shift
       ;;
     *)
       shift
@@ -106,9 +111,11 @@ if $is_post; then
   printf '%s\n' "$max_time" >> "$state_dir/post-max-times"
   printf '%s\n' "$connect_timeout" >> "$state_dir/post-connect-timeouts"
   printf '%s\n' "$authorization" >> "$state_dir/post-authorizations"
+  printf '%s\n' "$request_url" >> "$state_dir/post-urls"
   result=$(sequence_value "$state_dir/post-results" "$count")
   printf 'response-%s-attempt-%s\n' "$result" "$count" > "$response_file"
   if [ "$result" = 000 ]; then
+    printf '000'
     exit 7
   fi
   printf '%s' "$result"
@@ -272,6 +279,7 @@ prepare_case() {
   : > "$CASE_DIR/post-max-times"
   : > "$CASE_DIR/post-connect-timeouts"
   : > "$CASE_DIR/post-authorizations"
+  : > "$CASE_DIR/post-urls"
   : > "$CASE_DIR/token-starts"
   : > "$CASE_DIR/token-max-times"
   : > "$CASE_DIR/token-connect-timeouts"
@@ -334,6 +342,18 @@ assert_contains() {
   if [[ $value != *"$expected"* ]]; then
     printf '  assertion failed: %s\n  missing: %q\n  output:\n%s\n' \
       "$message" "$expected" "$value" >&2
+    return 1
+  fi
+}
+
+assert_not_contains() {
+  local value=$1
+  local unexpected=$2
+  local message=$3
+
+  if [[ $value == *"$unexpected"* ]]; then
+    printf '  assertion failed: %s\n  unexpected: %q\n  output:\n%s\n' \
+      "$message" "$unexpected" "$value" >&2
     return 1
   fi
 }
@@ -412,6 +432,11 @@ test_deadline_stops_429_retries() {
   assert_contains "$RUN_OUTPUT" "$deadline_iso" 'failure states UTC deadline' || return 1
   assert_contains "$RUN_OUTPUT" 'notAfter' 'failure explains certificate deadline' || return 1
   assert_contains "$RUN_OUTPUT" '120' 'failure explains verification margin' || return 1
+  assert_contains "$RUN_OUTPUT" \
+    'Re-run the failed publish job: it signs again with fresh certificates. If an earlier attempt already committed, the registry answers the rerun with 200 because the artifact is unchanged.' \
+    'publish deadline failure explains how to retry safely' || return 1
+  assert_not_contains "$RUN_OUTPUT" 'The last attempt may have committed on the registry.' \
+    '429 does not imply an ambiguous registry commit' || return 1
 }
 
 test_5xx_and_transport_errors_retry() {
@@ -442,7 +467,32 @@ test_400_fails_immediately() {
   assert_equal 0 "$(line_count "$CASE_DIR/sleeps")" '400 does not sleep' || return 1
 }
 
-test_409_fails_immediately() {
+test_403_prints_trusted_publisher_hint() {
+  local payload
+  local initial_time=$((EARLY_CERT_EPOCH - 120 - 300))
+  local expected_hint
+
+  expected_hint=$'Hint: check release-tag-environment mode, environment `release`, and that the trusted-publisher policy points at the caller\'s .github/workflows/release.yml.'
+  payload=$(main_bundle_payload "$EARLY_CERT_RAW") || return 1
+
+  prepare_case "$initial_time" 403
+  run_registry_request Publish "$payload"
+
+  assert_equal 1 "$RUN_STATUS" 'publish 403 fails' || return 1
+  assert_equal 1 "$(line_count "$CASE_DIR/post-starts")" 'publish 403 is not retried' || return 1
+  assert_contains "$RUN_OUTPUT" "$expected_hint" 'publish 403 explains the trusted-publisher checks' || return 1
+  assert_equal 1 "$(grep -c '^Hint:' <<< "$RUN_OUTPUT")" 'publish 403 prints one hint line' || return 1
+
+  prepare_case "$initial_time" 403
+  run_registry_request Yank '{}'
+
+  assert_equal 1 "$RUN_STATUS" 'yank 403 fails' || return 1
+  assert_equal 1 "$(line_count "$CASE_DIR/post-starts")" 'yank 403 is not retried' || return 1
+  assert_contains "$RUN_OUTPUT" "$expected_hint" 'yank 403 explains the trusted-publisher checks' || return 1
+  assert_equal 1 "$(grep -c '^Hint:' <<< "$RUN_OUTPUT")" 'yank 403 prints one hint line' || return 1
+}
+
+test_publish_409_prints_content_conflict_hint() {
   local payload
   local initial_time=$((EARLY_CERT_EPOCH - 120 - 300))
 
@@ -453,6 +503,21 @@ test_409_fails_immediately() {
   assert_equal 1 "$RUN_STATUS" '409 remains a conflict' || return 1
   assert_equal 1 "$(line_count "$CASE_DIR/post-starts")" '409 is not retried' || return 1
   assert_equal 0 "$(line_count "$CASE_DIR/sleeps")" '409 does not sleep' || return 1
+  assert_contains "$RUN_OUTPUT" \
+    'Hint: the version already exists with different content; re-running the whole workflow rebuilds docs with a new digest — re-run only the failed job, or publish a new version.' \
+    'publish 409 explains how to avoid rebuilding docs with a new digest' || return 1
+}
+
+test_yank_409_omits_publish_content_conflict_hint() {
+  local initial_time=2000000000
+
+  prepare_case "$initial_time" 409
+  run_registry_request Yank '{}'
+
+  assert_equal 1 "$RUN_STATUS" 'yank 409 fails' || return 1
+  assert_equal 1 "$(line_count "$CASE_DIR/post-starts")" 'yank 409 is not retried' || return 1
+  assert_not_contains "$RUN_OUTPUT" 'the version already exists with different content' \
+    'yank 409 does not print the publish-only content conflict hint' || return 1
 }
 
 test_200_succeeds() {
@@ -534,8 +599,31 @@ test_transport_deadline_warns_before_rerun() {
   assert_equal 0 "$(line_count "$CASE_DIR/sleeps")" 'transport error at the deadline does not sleep' || return 1
   assert_contains "$RUN_OUTPUT" 'last status: 000' 'deadline failure reports the transport status' || return 1
   assert_contains "$RUN_OUTPUT" \
-    'The last attempt may have committed on the registry; check whether the version is listed before re-running, since a rerun needs a fresh signature.' \
+    'Re-run the failed publish job: it signs again with fresh certificates. If an earlier attempt already committed, the registry answers the rerun with 200 because the artifact is unchanged.' \
+    'transport deadline failure explains how to retry the publish' || return 1
+  assert_contains "$RUN_OUTPUT" \
+    'The last attempt may have committed on the registry.' \
     'transport deadline failure warns about an ambiguous commit' || return 1
+  assert_not_contains "$RUN_OUTPUT" 'check whether the version is listed' \
+    'obsolete transport-error guidance is removed' || return 1
+}
+
+test_publish_5xx_deadline_warns_about_ambiguous_commit() {
+  local payload
+  local deadline=$((EARLY_CERT_EPOCH - 120))
+
+  payload=$(main_bundle_payload "$EARLY_CERT_RAW") || return 1
+  prepare_case "$deadline" 503
+  run_registry_request Publish "$payload"
+
+  assert_equal 1 "$RUN_STATUS" 'publish 5xx at the deadline fails' || return 1
+  assert_equal 1 "$(line_count "$CASE_DIR/post-starts")" 'publish 5xx at the deadline is not retried' || return 1
+  assert_contains "$RUN_OUTPUT" 'last status: 503' 'deadline failure reports the 5xx status' || return 1
+  assert_contains "$RUN_OUTPUT" \
+    'Re-run the failed publish job: it signs again with fresh certificates. If an earlier attempt already committed, the registry answers the rerun with 200 because the artifact is unchanged.' \
+    '5xx deadline failure explains how to retry the publish' || return 1
+  assert_contains "$RUN_OUTPUT" 'The last attempt may have committed on the registry.' \
+    'publish 5xx deadline failure warns about an ambiguous commit' || return 1
 }
 
 test_docs_earlier_not_after_sets_deadline() {
@@ -566,6 +654,9 @@ test_missing_certificate_fails_before_post() {
   assert_equal 0 "$(line_count "$CASE_DIR/token-starts")" 'missing certificate prevents token request' || return 1
   assert_contains "$RUN_OUTPUT" '.sigstore_bundle' 'error names the invalid bundle' || return 1
   assert_contains "$RUN_OUTPUT" 'readable leaf certificate' 'error explains certificate failure' || return 1
+  assert_contains "$RUN_OUTPUT" \
+    "Re-running won't help; the bundle format may have changed. Report it to carina-rs/provider-release." \
+    'certificate error explains that rerunning cannot fix a format change' || return 1
 }
 
 test_unparseable_certificate_fails_before_post() {
@@ -581,6 +672,9 @@ test_unparseable_certificate_fails_before_post() {
   assert_equal 0 "$(line_count "$CASE_DIR/token-starts")" 'unparseable certificate prevents token request' || return 1
   assert_contains "$RUN_OUTPUT" '.sigstore_bundle' 'error names the unparseable bundle' || return 1
   assert_contains "$RUN_OUTPUT" 'readable leaf certificate' 'error explains parse failure' || return 1
+  assert_contains "$RUN_OUTPUT" \
+    "Re-running won't help; the bundle format may have changed. Report it to carina-rs/provider-release." \
+    'parse error explains that rerunning cannot fix a format change' || return 1
 }
 
 test_missing_docs_certificate_fails_before_post() {
@@ -603,6 +697,9 @@ test_missing_docs_certificate_fails_before_post() {
   assert_equal 0 "$(line_count "$CASE_DIR/token-starts")" 'missing docs certificate prevents token request' || return 1
   assert_contains "$RUN_OUTPUT" '.docs.sigstore_bundle' 'error names the invalid docs bundle' || return 1
   assert_contains "$RUN_OUTPUT" 'readable leaf certificate' 'docs error explains certificate failure' || return 1
+  assert_contains "$RUN_OUTPUT" \
+    "Re-running won't help; the bundle format may have changed. Report it to carina-rs/provider-release." \
+    'docs certificate error explains that rerunning cannot fix a format change' || return 1
 }
 
 test_expired_publish_deadline_fails_before_attempt() {
@@ -621,6 +718,11 @@ test_expired_publish_deadline_fails_before_attempt() {
   assert_equal 0 "$(line_count "$CASE_DIR/token-starts")" 'past deadline prevents token request' || return 1
   assert_contains "$RUN_OUTPUT" 'notAfter' 'past-deadline error names notAfter' || return 1
   assert_contains "$RUN_OUTPUT" "$not_after_iso" 'past-deadline error names certificate expiry' || return 1
+  assert_contains "$RUN_OUTPUT" \
+    'Re-run the failed publish job: it signs again with fresh certificates. If an earlier attempt already committed, the registry answers the rerun with 200 because the artifact is unchanged.' \
+    'zero-attempt publish deadline failure still explains what to do' || return 1
+  assert_not_contains "$RUN_OUTPUT" 'The last attempt may have committed on the registry.' \
+    'zero-attempt publish failure does not imply an ambiguous commit' || return 1
 }
 
 test_yank_uses_ten_minute_deadline() {
@@ -639,6 +741,61 @@ test_yank_uses_ten_minute_deadline() {
   assert_contains "$RUN_OUTPUT" 'Yank failed after 22 attempts' 'yank summary states attempt count' || return 1
   assert_contains "$RUN_OUTPUT" "$deadline_iso" 'yank summary states UTC deadline' || return 1
   assert_contains "$RUN_OUTPUT" '600' 'yank summary explains its retry window' || return 1
+  assert_contains "$RUN_OUTPUT" \
+    'Re-run the failed yank job; yanking an already-yanked version succeeds.' \
+    'yank deadline failure explains how to retry safely' || return 1
+  assert_not_contains "$RUN_OUTPUT" 'The last attempt may have committed on the registry.' \
+    '429 does not imply an ambiguous registry commit' || return 1
+}
+
+test_yank_transport_deadline_warns_about_ambiguous_commit() {
+  local initial_time=2000000000
+
+  prepare_case "$initial_time" 000
+  run_registry_request Yank '{}'
+
+  assert_equal 1 "$RUN_STATUS" 'yank transport retries stop at the deadline' || return 1
+  assert_contains "$RUN_OUTPUT" 'last status: 000' 'yank deadline failure reports the transport status' || return 1
+  assert_contains "$RUN_OUTPUT" \
+    'Re-run the failed yank job; yanking an already-yanked version succeeds.' \
+    'yank transport deadline failure explains how to retry' || return 1
+  assert_contains "$RUN_OUTPUT" 'The last attempt may have committed on the registry.' \
+    'yank transport deadline failure warns about an ambiguous commit' || return 1
+}
+
+test_yank_5xx_deadline_warns_about_ambiguous_commit() {
+  local initial_time=2000000000
+
+  prepare_case "$initial_time" 503
+  run_registry_request Yank '{}'
+
+  assert_equal 1 "$RUN_STATUS" 'yank 5xx retries stop at the deadline' || return 1
+  assert_contains "$RUN_OUTPUT" 'last status: 503' 'yank deadline failure reports the 5xx status' || return 1
+  assert_contains "$RUN_OUTPUT" \
+    'Re-run the failed yank job; yanking an already-yanked version succeeds.' \
+    'yank 5xx deadline failure explains how to retry' || return 1
+  assert_contains "$RUN_OUTPUT" 'The last attempt may have committed on the registry.' \
+    'yank 5xx deadline failure warns about an ambiguous commit' || return 1
+}
+
+test_operations_post_to_their_configured_urls() {
+  local payload
+  local initial_time=$((EARLY_CERT_EPOCH - 120 - 300))
+
+  payload=$(main_bundle_payload "$EARLY_CERT_RAW") || return 1
+  prepare_case "$initial_time" 201
+  run_registry_request Publish "$payload"
+
+  assert_equal 0 "$RUN_STATUS" 'publish URL routing request succeeds' || return 1
+  assert_equal 'https://registry.example.test/publish' "$(< "$CASE_DIR/post-urls")" \
+    'Publish posts to REGISTRY_PUBLISH_URL' || return 1
+
+  prepare_case "$initial_time" 200
+  run_registry_request Yank '{}'
+
+  assert_equal 0 "$RUN_STATUS" 'yank URL routing request succeeds' || return 1
+  assert_equal 'https://registry.example.test/yank' "$(< "$CASE_DIR/post-urls")" \
+    'Yank posts to REGISTRY_YANK_URL' || return 1
 }
 
 test_sleep_never_exceeds_remaining_time() {
@@ -672,18 +829,24 @@ run_test '429 uses capped backoff and can reach 201' test_429_backoff_then_201
 run_test '429 retries stop at the certificate deadline' test_deadline_stops_429_retries
 run_test '5xx and transport errors are retried' test_5xx_and_transport_errors_retry
 run_test '400 fails after one POST' test_400_fails_immediately
-run_test '409 fails after one POST' test_409_fails_immediately
+run_test '403 prints trusted-publisher guidance for both operations' test_403_prints_trusted_publisher_hint
+run_test 'Publish 409 explains the content conflict' test_publish_409_prints_content_conflict_hint
+run_test 'Yank 409 omits the publish content-conflict hint' test_yank_409_omits_publish_content_conflict_hint
 run_test '200 is successful' test_200_succeeds
 run_test 'OIDC token failures are retried with a fresh token' test_token_failure_retries
 run_test 'a token fetch crossing the deadline prevents POST' test_token_fetch_past_deadline_prevents_post
 run_test 'a retry attempt may start exactly at the deadline' test_retry_attempt_can_start_at_deadline
 run_test 'a deadline after HTTP 000 warns before re-running' test_transport_deadline_warns_before_rerun
+run_test 'a Publish deadline after HTTP 5xx warns about an ambiguous commit' test_publish_5xx_deadline_warns_about_ambiguous_commit
 run_test 'the earlier docs certificate controls the deadline' test_docs_earlier_not_after_sets_deadline
 run_test 'a missing leaf certificate fails before any request' test_missing_certificate_fails_before_post
 run_test 'an unparseable leaf certificate fails before any request' test_unparseable_certificate_fails_before_post
 run_test 'a present docs bundle must contain a readable certificate' test_missing_docs_certificate_fails_before_post
 run_test 'an already-past publish deadline fails before any request' test_expired_publish_deadline_fails_before_attempt
 run_test 'yank retries for ten minutes' test_yank_uses_ten_minute_deadline
+run_test 'a Yank deadline after HTTP 000 warns about an ambiguous commit' test_yank_transport_deadline_warns_about_ambiguous_commit
+run_test 'a Yank deadline after HTTP 5xx warns about an ambiguous commit' test_yank_5xx_deadline_warns_about_ambiguous_commit
+run_test 'Publish and Yank post to their operation-specific URLs' test_operations_post_to_their_configured_urls
 run_test 'sleep is capped by the remaining deadline' test_sleep_never_exceeds_remaining_time
 
 if [ "$FAILURES" -ne 0 ]; then

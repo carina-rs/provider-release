@@ -69,7 +69,8 @@ runs:
           done
         }
 
-        # Sign docs first so the WASM certificate stays freshest for the publish retry loop.
+        # The publish retry deadline is set by the earlier of the two certificates'
+        # notAfter, so keep signing both right before publishing.
         sign_blob "${PROVIDER}-${GITHUB_REF_NAME}-docs.tar.gz" docs-sigstore-bundle.json
         sign_blob "${PROVIDER}-${GITHUB_REF_NAME}.wasm" sigstore-bundle.json
 

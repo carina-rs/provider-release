@@ -130,13 +130,24 @@ print_deadline_failure() {
   if [ "$attempts" -eq 0 ]; then
     printf '%s failed after 0 attempts (last status: %s): retry deadline %s has already passed before the first attempt; it is %s\n' \
       "$operation" "$last_status" "$deadline_iso" "$deadline_reason" >&2
-    return
+  else
+    printf '%s failed after %s attempts (last status: %s); retry deadline %s exists because it is %s\n' \
+      "$operation" "$attempts" "$last_status" "$deadline_iso" "$deadline_reason" >&2
   fi
-  printf '%s failed after %s attempts (last status: %s); retry deadline %s exists because it is %s\n' \
-    "$operation" "$attempts" "$last_status" "$deadline_iso" "$deadline_reason" >&2
-  if [ "$last_status" = 000 ]; then
-    printf 'The last attempt may have committed on the registry; check whether the version is listed before re-running, since a rerun needs a fresh signature.\n' >&2
-  fi
+
+  case "$operation" in
+    Publish)
+      printf 'Re-run the failed publish job: it signs again with fresh certificates. If an earlier attempt already committed, the registry answers the rerun with 200 because the artifact is unchanged.\n' >&2
+      ;;
+    Yank)
+      printf 'Re-run the failed yank job; yanking an already-yanked version succeeds.\n' >&2
+      ;;
+  esac
+  case "$last_status" in
+    000|5??)
+      printf 'The last attempt may have committed on the registry.\n' >&2
+      ;;
+  esac
 }
 
 validate_release_tag() {
@@ -187,6 +198,7 @@ registry_request() {
           || ! certificate_epoch=$(bundle_certificate_not_after_epoch "$bundle"); then
           printf 'Publish bundle %s has no readable leaf certificate at verificationMaterial.certificate.rawBytes or verificationMaterial.x509CertificateChain.certificates[0].rawBytes\n' \
             "$bundle_path" >&2
+          printf "%s\n" "Re-running won't help; the bundle format may have changed. Report it to carina-rs/provider-release." >&2
           exit 1
         fi
         if [ -z "${earliest_not_after_epoch:-}" ] \
@@ -272,6 +284,18 @@ registry_request() {
           continue
         fi
         print_deadline_failure "$operation" "$attempt" "$last_status" "$deadline" "$deadline_reason"
+        exit 1
+        ;;
+      403)
+        printf '%s failed with non-retryable status %s\n' "$operation" "$status" >&2
+        printf "Hint: check release-tag-environment mode, environment \`release\`, and that the trusted-publisher policy points at the caller's .github/workflows/release.yml.\n" >&2
+        exit 1
+        ;;
+      409)
+        printf '%s failed with non-retryable status %s\n' "$operation" "$status" >&2
+        if [ "$operation" = Publish ]; then
+          printf 'Hint: the version already exists with different content; re-running the whole workflow rebuilds docs with a new digest — re-run only the failed job, or publish a new version.\n' >&2
+        fi
         exit 1
         ;;
       4??)
