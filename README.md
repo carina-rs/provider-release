@@ -39,11 +39,9 @@ release files use the same name.
 
 ## Example
 
-The third-party template uses `carina-provider-example` as the Cargo binary and
-artifact prefix, `example` as the registry provider name, and `your-namespace` as
-the registry namespace. It uses the default stable WASM toolchain and runs
-`./scripts/generate-docs.sh` as `docs-generate`; replace those values and the
-all-zero commit SHA for your provider.
+Use [`examples/release.yml`](examples/release.yml) as the generic third-party
+caller template; replace its artifact prefix, registry name and namespace, docs
+directory, and all-zero SHA.
 
 ## Pinning
 
@@ -75,8 +73,6 @@ the example only after reviewing the target commit's diff.
 | `provider` | yes | — | Artifact prefix |
 | `name` | yes | — | Registry provider name |
 | `namespace` | yes | — | Registry namespace |
-| `registry-audience` | no | `registry.carina-rs.dev` | OIDC token audience |
-| `registry-publish-url` | no | `https://publish.registry.carina-rs.dev/v1/publish` | Publish endpoint |
 
 ### `yank/action.yml`
 
@@ -84,8 +80,6 @@ the example only after reviewing the target commit's diff.
 | --- | --- | --- | --- |
 | `name` | yes | — | Registry provider name |
 | `namespace` | yes | — | Registry namespace |
-| `registry-audience` | no | `registry.carina-rs.dev` | OIDC token audience |
-| `registry-yank-url` | no | `https://publish.registry.carina-rs.dev/v1/yank` | Yank endpoint |
 
 ## Security
 
@@ -93,10 +87,5 @@ Composite actions run with the caller job's permissions and secrets. The publish
 and yank jobs hold `id-token: write`, so any action they run can mint a registry
 OIDC token for that provider. Pin this repository by full commit SHA and review the
 diff before every bump. Keep `id-token: write` off the build and GitHub release
-jobs.
-
-## Summary
-
-Use the reusable workflow for unprivileged builds and the composite actions for
-identity-sensitive release operations. Keep the caller contract, environment
-restriction, trusted-publisher policy, and SHA pin aligned.
+jobs. The registry audience and write endpoints are fixed by the actions so a
+registry-scoped token cannot be redirected to another host.

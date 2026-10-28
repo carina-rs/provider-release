@@ -20,7 +20,16 @@ jobs:
     uses: carina-rs/provider-release/.github/workflows/build.yml@0000000000000000000000000000000000000000
     with:
       provider: carina-provider-example
-      docs-generate: ./scripts/generate-docs.sh
+      docs-generate: |
+        ./scripts/generate-docs.sh
+        docs_status=$(git status --porcelain -- generated-docs)
+        if ! git diff --exit-code || [ -n "$docs_status" ]; then
+          if [ -n "$docs_status" ]; then
+            printf '%s\n' "$docs_status"
+          fi
+          echo "::error::Generated documentation is stale. Run './scripts/generate-docs.sh' locally and commit the generated files before releasing."
+          exit 1
+        fi
 
   release:
     name: Create Release
