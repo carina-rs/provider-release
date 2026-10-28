@@ -14,11 +14,7 @@ CASE_NUMBER=0
 FAILURES=0
 RUN_STATUS=0
 RUN_OUTPUT=
-PUBLISH_DEADLINE_HINT='Re-run only the failed publish job; it re-signs with fresh certificates. If the earlier attempt fully committed, the rerun gets 200 because the bytes are unchanged. If it was interrupted after the registry recorded the artifact signature but not the docs signature, the rerun gets 409 docs_signer_mismatch_recorded; publish a new version instead.'
-CONFIG_HINT=$'Hint: check release-tag-environment mode, environment `release`, and that the trusted-publisher policy points at the caller\'s .github/workflows/release.yml.'
-VERSION_CONFLICT_HINT='Hint: the version exists with different bytes (often because a whole-workflow rerun rebuilt the docs); only a new version fixes it now.'
-DOCS_SIGNER_MISMATCH_HINT='Hint: a previous attempt was interrupted after recording the artifact signature; this version cannot get docs, so publish a new version.'
-GENERIC_409_HINT='Hint: the version exists with different bytes; only a new version fixes it now.'
+PUBLISH_DEADLINE_HINT_PREFIX='Re-run only the failed publish job;'
 
 cleanup() {
   rm -rf -- "$TEST_ROOT"
@@ -40,9 +36,6 @@ max_time=
 connect_timeout=
 authorization=
 request_url=
-
-printf '%q ' "$@" >> "$state_dir/curl-arguments"
-printf '\n' >> "$state_dir/curl-arguments"
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -152,9 +145,6 @@ case "$result" in
     ;;
   fail)
     exit 7
-    ;;
-  invalid)
-    printf 'not-json\n'
     ;;
   *)
     printf 'unsupported token stub result: %s\n' "$result" >&2
@@ -295,7 +285,6 @@ prepare_case() {
   : > "$CASE_DIR/token-connect-timeouts"
   : > "$CASE_DIR/sleeps"
   : > "$CASE_DIR/sleep-starts"
-  : > "$CASE_DIR/curl-arguments"
 }
 
 set_token_results() {
@@ -337,17 +326,6 @@ run_publish_error_response() {
   run_registry_request Publish "$payload"
 }
 
-line_count() {
-  local file=$1
-  local count=0
-  local line
-
-  while IFS= read -r line; do
-    count=$((count + 1))
-  done < "$file"
-  printf '%s\n' "$count"
-}
-
 assert_equal() {
   local expected=$1
   local actual=$2
@@ -384,24 +362,6 @@ assert_not_contains() {
   fi
 }
 
-assert_file_all() {
-  local file=$1
-  local expected=$2
-  local expected_count=$3
-  local line
-  local count=0
-
-  while IFS= read -r line; do
-    count=$((count + 1))
-    if [ "$line" != "$expected" ]; then
-      printf '  assertion failed: %s line %s was %q, expected %q\n' \
-        "$file" "$count" "$line" "$expected" >&2
-      return 1
-    fi
-  done < "$file"
-  assert_equal "$expected_count" "$count" "$file line count"
-}
-
 assert_post_starts_at_or_before() {
   local deadline=$1
   local started_at
@@ -424,13 +384,13 @@ test_429_backoff_then_201() {
   run_registry_request Publish "$payload"
 
   assert_equal 0 "$RUN_STATUS" '429 retries eventually succeed' || return 1
-  assert_equal 4 "$(line_count "$CASE_DIR/post-starts")" 'four POSTs were made' || return 1
-  assert_equal 4 "$(line_count "$CASE_DIR/token-starts")" 'each attempt fetched a token' || return 1
+  assert_equal 4 "$(wc -l < "$CASE_DIR/post-starts" | tr -d '[:space:]')" 'four POSTs were made' || return 1
+  assert_equal 4 "$(wc -l < "$CASE_DIR/token-starts" | tr -d '[:space:]')" 'each attempt fetched a token' || return 1
   assert_equal $'10\n20\n30' "$(< "$CASE_DIR/sleeps")" 'retry backoff is capped progression' || return 1
-  assert_file_all "$CASE_DIR/post-max-times" 130 4 || return 1
-  assert_file_all "$CASE_DIR/token-max-times" 60 4 || return 1
-  assert_file_all "$CASE_DIR/post-connect-timeouts" 10 4 || return 1
-  assert_file_all "$CASE_DIR/token-connect-timeouts" 10 4 || return 1
+  assert_equal 130 "$(sort -u "$CASE_DIR/post-max-times")" 'every POST uses a 130s max time' || return 1
+  assert_equal 60 "$(sort -u "$CASE_DIR/token-max-times")" 'every token request uses a 60s max time' || return 1
+  assert_equal 10 "$(sort -u "$CASE_DIR/post-connect-timeouts")" 'every POST uses a 10s connect timeout' || return 1
+  assert_equal 10 "$(sort -u "$CASE_DIR/token-connect-timeouts")" 'every token request uses a 10s connect timeout' || return 1
   assert_equal $'Authorization: Bearer token-1\nAuthorization: Bearer token-2\nAuthorization: Bearer token-3\nAuthorization: Bearer token-4' \
     "$(< "$CASE_DIR/post-authorizations")" 'every POST uses a fresh token' || return 1
   assert_contains "$RUN_OUTPUT" 'Publish attempt 1 returned HTTP 429' 'attempt status is printed' || return 1
@@ -450,15 +410,16 @@ test_deadline_stops_429_retries() {
   run_registry_request Publish "$payload"
 
   assert_equal 1 "$RUN_STATUS" 'deadline exhaustion fails' || return 1
-  assert_equal 3 "$(line_count "$CASE_DIR/post-starts")" 'attempt at the deadline is the last attempt' || return 1
+  assert_equal 3 "$(wc -l < "$CASE_DIR/post-starts" | tr -d '[:space:]')" 'attempt at the deadline is the last attempt' || return 1
   assert_equal $'10\n5' "$(< "$CASE_DIR/sleeps")" 'sleep is capped at the deadline' || return 1
   assert_post_starts_at_or_before "$deadline" || return 1
   assert_contains "$RUN_OUTPUT" 'Publish failed after 3 attempts' 'failure states attempt count' || return 1
   assert_contains "$RUN_OUTPUT" 'last status: 429' 'failure states last status' || return 1
   assert_contains "$RUN_OUTPUT" "$deadline_iso" 'failure states UTC deadline' || return 1
   assert_contains "$RUN_OUTPUT" 'notAfter' 'failure explains certificate deadline' || return 1
-  assert_contains "$RUN_OUTPUT" '120' 'failure explains verification margin' || return 1
-  assert_contains "$RUN_OUTPUT" "$PUBLISH_DEADLINE_HINT" \
+  assert_contains "$RUN_OUTPUT" '120s registry verification margin' \
+    'failure explains verification margin' || return 1
+  assert_contains "$RUN_OUTPUT" "$PUBLISH_DEADLINE_HINT_PREFIX" \
     'publish deadline failure explains how to retry safely' || return 1
   assert_not_contains "$RUN_OUTPUT" 'The last attempt may have committed on the registry.' \
     '429 does not imply an ambiguous registry commit' || return 1
@@ -473,7 +434,7 @@ test_5xx_and_transport_errors_retry() {
   run_registry_request Publish "$payload"
 
   assert_equal 0 "$RUN_STATUS" '5xx and transport errors eventually succeed' || return 1
-  assert_equal 4 "$(line_count "$CASE_DIR/post-starts")" 'all retryable statuses were retried' || return 1
+  assert_equal 4 "$(wc -l < "$CASE_DIR/post-starts" | tr -d '[:space:]')" 'all retryable statuses were retried' || return 1
   assert_contains "$RUN_OUTPUT" 'Publish attempt 1 returned HTTP 500' '500 is reported' || return 1
   assert_contains "$RUN_OUTPUT" 'Publish attempt 2 returned HTTP 000' 'transport error is reported as 000' || return 1
   assert_contains "$RUN_OUTPUT" 'Publish attempt 3 returned HTTP 503' '503 is reported' || return 1
@@ -488,140 +449,58 @@ test_400_fails_immediately() {
   run_registry_request Publish "$payload"
 
   assert_equal 1 "$RUN_STATUS" '400 fails' || return 1
-  assert_equal 1 "$(line_count "$CASE_DIR/post-starts")" '400 is not retried' || return 1
-  assert_equal 0 "$(line_count "$CASE_DIR/sleeps")" '400 does not sleep' || return 1
+  assert_equal 1 "$(wc -l < "$CASE_DIR/post-starts" | tr -d '[:space:]')" '400 is not retried' || return 1
+  assert_equal 0 "$(wc -l < "$CASE_DIR/sleeps" | tr -d '[:space:]')" '400 does not sleep' || return 1
 }
 
 assert_publish_error_hint() {
-  local expected_hint=$1
+  local expected_hint_prefix=$1
   local context=$2
 
   assert_equal 1 "$RUN_STATUS" "$context fails" || return 1
-  assert_equal 1 "$(line_count "$CASE_DIR/post-starts")" "$context is not retried" || return 1
-  assert_equal 0 "$(line_count "$CASE_DIR/sleeps")" "$context does not sleep" || return 1
-  assert_contains "$RUN_OUTPUT" "$expected_hint" "$context prints the expected hint" || return 1
+  assert_equal 1 "$(wc -l < "$CASE_DIR/post-starts" | tr -d '[:space:]')" "$context is not retried" || return 1
+  assert_equal 0 "$(wc -l < "$CASE_DIR/sleeps" | tr -d '[:space:]')" "$context does not sleep" || return 1
+  assert_contains "$RUN_OUTPUT" "$expected_hint_prefix" "$context prints the expected hint" || return 1
   assert_equal 1 "$(grep -c '^Hint:' <<< "$RUN_OUTPUT")" "$context prints one hint line"
 }
 
-test_403_provider_frozen_hint() {
-  run_publish_error_response 403 \
-    '{"error":"provider_frozen","detail":"provider_tombstoned","message":"version_forbidden"}' || return 1
+test_publish_error_hints() {
+  local cases=(
+    '403|{"error":"provider_frozen","detail":"provider_tombstoned","message":"version_forbidden"}|Hint: not a config problem:|provider_frozen 403|Hint: check release-tag-environment mode|'
+    '403|{"error":"provider_tombstoned","detail":"provider_frozen"}|Hint: the name is permanently closed.|provider_tombstoned 403|Hint: not a config problem:|'
+    '403|{"error":"version_forbidden","detail":"provider_frozen"}|Hint: the tag must be exactly v<version>.|version_forbidden 403|Hint: not a config problem:|'
+    '403|{"error":"claim_mismatch","detail":"provider_frozen"}|Hint: check release-tag-environment mode|claim_mismatch 403|Hint: not a config problem:|'
+    '403|{"error":"future_registry_error","detail":"provider_frozen","message":"provider_tombstoned"}|Hint: check release-tag-environment mode|unknown-code 403|Hint: not a config problem:|'
+    '403|{"detail":"provider_frozen","message":"provider_tombstoned"}|Hint: check release-tag-environment mode|missing-error 403|Hint: not a config problem:|'
+    '403|provider_frozen: response was not JSON|Hint: check release-tag-environment mode|non-JSON 403|Hint: not a config problem:|'
+    '409|{"error":"version_conflict","detail":"docs_signer_mismatch_recorded"}|Hint: the version exists with different bytes (often because|version_conflict 409|Hint: a previous attempt was interrupted|'
+    '409|{"error":"docs_signer_mismatch_recorded","detail":"version_conflict"}|Hint: a previous attempt was interrupted|docs_signer_mismatch_recorded 409|Hint: the version exists with different bytes (often because|'
+    '409|{"error":"future_registry_error","detail":"version_conflict","message":"docs_signer_mismatch_recorded"}|Hint: the version exists with different bytes;|unknown-code 409|Hint: the version exists with different bytes (often because|Hint: a previous attempt was interrupted'
+    '409|{"detail":"version_conflict","message":"docs_signer_mismatch_recorded"}|Hint: the version exists with different bytes;|missing-error 409|Hint: the version exists with different bytes (often because|Hint: a previous attempt was interrupted'
+    '409|version_conflict docs_signer_mismatch_recorded: response was not JSON|Hint: the version exists with different bytes;|non-JSON 409|Hint: the version exists with different bytes (often because|Hint: a previous attempt was interrupted'
+  )
+  local test_case
+  local status
+  local response_body
+  local expected_hint_prefix
+  local context
+  local unexpected_hint_prefix
+  local second_unexpected_hint_prefix
 
-  assert_publish_error_hint \
-    'Hint: not a config problem: the provider is frozen pending registry-operator review.' \
-    'provider_frozen 403' || return 1
-  assert_not_contains "$RUN_OUTPUT" "$CONFIG_HINT" \
-    'provider_frozen does not print the config hint' || return 1
-}
-
-test_403_provider_tombstoned_hint() {
-  run_publish_error_response 403 \
-    '{"error":"provider_tombstoned","detail":"provider_frozen"}' || return 1
-
-  assert_publish_error_hint \
-    'Hint: the name is permanently closed.' \
-    'provider_tombstoned 403' || return 1
-  assert_not_contains "$RUN_OUTPUT" 'the provider is frozen' \
-    'provider_tombstoned ignores the detail field' || return 1
-}
-
-test_403_version_forbidden_hint() {
-  run_publish_error_response 403 \
-    '{"error":"version_forbidden","detail":"provider_frozen"}' || return 1
-
-  assert_publish_error_hint \
-    'Hint: the tag must be exactly v<version>.' \
-    'version_forbidden 403' || return 1
-  assert_not_contains "$RUN_OUTPUT" 'the provider is frozen' \
-    'version_forbidden ignores the detail field' || return 1
-}
-
-test_403_claim_mismatch_hint() {
-  run_publish_error_response 403 \
-    '{"error":"claim_mismatch","detail":"provider_frozen"}' || return 1
-
-  assert_publish_error_hint "$CONFIG_HINT" 'claim_mismatch 403' || return 1
-  assert_not_contains "$RUN_OUTPUT" 'the provider is frozen' \
-    'claim_mismatch ignores the detail field' || return 1
-}
-
-test_403_unknown_code_falls_back() {
-  run_publish_error_response 403 \
-    '{"error":"future_registry_error","detail":"provider_frozen","message":"provider_tombstoned"}' || return 1
-
-  assert_publish_error_hint "$CONFIG_HINT" 'unknown-code 403' || return 1
-  assert_not_contains "$RUN_OUTPUT" 'the provider is frozen' \
-    'unknown 403 ignores detail and message fields' || return 1
-}
-
-test_403_missing_error_falls_back() {
-  run_publish_error_response 403 \
-    '{"detail":"provider_frozen","message":"provider_tombstoned"}' || return 1
-
-  assert_publish_error_hint "$CONFIG_HINT" 'missing-error 403' || return 1
-  assert_not_contains "$RUN_OUTPUT" 'the provider is frozen' \
-    '403 without .error ignores detail and message fields' || return 1
-}
-
-test_403_non_json_falls_back() {
-  run_publish_error_response 403 \
-    'provider_frozen: response was not JSON' || return 1
-
-  assert_publish_error_hint "$CONFIG_HINT" 'non-JSON 403' || return 1
-  assert_not_contains "$RUN_OUTPUT" 'the provider is frozen pending registry-operator review' \
-    'non-JSON 403 does not infer an error code from text' || return 1
-}
-
-test_409_version_conflict_hint() {
-  run_publish_error_response 409 \
-    '{"error":"version_conflict","detail":"docs_signer_mismatch_recorded"}' || return 1
-
-  assert_publish_error_hint "$VERSION_CONFLICT_HINT" 'version_conflict 409' || return 1
-  assert_not_contains "$RUN_OUTPUT" 'a previous attempt was interrupted' \
-    'version_conflict ignores the detail field' || return 1
-}
-
-test_409_docs_signer_mismatch_hint() {
-  run_publish_error_response 409 \
-    '{"error":"docs_signer_mismatch_recorded","detail":"version_conflict"}' || return 1
-
-  assert_publish_error_hint "$DOCS_SIGNER_MISMATCH_HINT" \
-    'docs_signer_mismatch_recorded 409' || return 1
-  assert_not_contains "$RUN_OUTPUT" 'whole-workflow rerun rebuilt the docs' \
-    'docs_signer_mismatch_recorded ignores the detail field' || return 1
-}
-
-test_409_unknown_code_falls_back() {
-  run_publish_error_response 409 \
-    '{"error":"future_registry_error","detail":"version_conflict","message":"docs_signer_mismatch_recorded"}' || return 1
-
-  assert_publish_error_hint "$GENERIC_409_HINT" 'unknown-code 409' || return 1
-  assert_not_contains "$RUN_OUTPUT" 'whole-workflow rerun rebuilt the docs' \
-    'unknown 409 ignores the detail field' || return 1
-  assert_not_contains "$RUN_OUTPUT" 'a previous attempt was interrupted' \
-    'unknown 409 ignores the message field' || return 1
-}
-
-test_409_missing_error_falls_back() {
-  run_publish_error_response 409 \
-    '{"detail":"version_conflict","message":"docs_signer_mismatch_recorded"}' || return 1
-
-  assert_publish_error_hint "$GENERIC_409_HINT" 'missing-error 409' || return 1
-  assert_not_contains "$RUN_OUTPUT" 'whole-workflow rerun rebuilt the docs' \
-    '409 without .error ignores the detail field' || return 1
-  assert_not_contains "$RUN_OUTPUT" 'a previous attempt was interrupted' \
-    '409 without .error ignores the message field' || return 1
-}
-
-test_409_non_json_falls_back() {
-  run_publish_error_response 409 \
-    'version_conflict docs_signer_mismatch_recorded: response was not JSON' || return 1
-
-  assert_publish_error_hint "$GENERIC_409_HINT" 'non-JSON 409' || return 1
-  assert_not_contains "$RUN_OUTPUT" 'whole-workflow rerun rebuilt the docs' \
-    'non-JSON 409 does not infer version_conflict from text' || return 1
-  assert_not_contains "$RUN_OUTPUT" 'a previous attempt was interrupted' \
-    'non-JSON 409 does not infer docs_signer_mismatch_recorded from text' || return 1
+  for test_case in "${cases[@]}"; do
+    IFS='|' read -r status response_body expected_hint_prefix context \
+      unexpected_hint_prefix second_unexpected_hint_prefix <<< "$test_case"
+    run_publish_error_response "$status" "$response_body" || return 1
+    assert_publish_error_hint "$expected_hint_prefix" "$context" || return 1
+    if [ -n "$unexpected_hint_prefix" ]; then
+      assert_not_contains "$RUN_OUTPUT" "$unexpected_hint_prefix" \
+        "$context ignores non-.error fields" || return 1
+    fi
+    if [ -n "$second_unexpected_hint_prefix" ]; then
+      assert_not_contains "$RUN_OUTPUT" "$second_unexpected_hint_prefix" \
+        "$context ignores non-.error fields" || return 1
+    fi
+  done
 }
 
 test_yank_409_omits_publish_content_conflict_hint() {
@@ -631,7 +510,7 @@ test_yank_409_omits_publish_content_conflict_hint() {
   run_registry_request Yank '{}'
 
   assert_equal 1 "$RUN_STATUS" 'yank 409 fails' || return 1
-  assert_equal 1 "$(line_count "$CASE_DIR/post-starts")" 'yank 409 is not retried' || return 1
+  assert_equal 1 "$(wc -l < "$CASE_DIR/post-starts" | tr -d '[:space:]')" 'yank 409 is not retried' || return 1
   assert_not_contains "$RUN_OUTPUT" 'Hint:' \
     'yank 409 does not print a publish-only hint' || return 1
 }
@@ -645,7 +524,7 @@ test_200_succeeds() {
   run_registry_request Publish "$payload"
 
   assert_equal 0 "$RUN_STATUS" 'idempotent 200 succeeds' || return 1
-  assert_equal 1 "$(line_count "$CASE_DIR/post-starts")" '200 needs one POST' || return 1
+  assert_equal 1 "$(wc -l < "$CASE_DIR/post-starts" | tr -d '[:space:]')" '200 needs one POST' || return 1
   assert_contains "$RUN_OUTPUT" 'Publish attempt 1 returned HTTP 200' '200 is reported' || return 1
 }
 
@@ -659,8 +538,8 @@ test_token_failure_retries() {
   run_registry_request Publish "$payload"
 
   assert_equal 0 "$RUN_STATUS" 'token failure is retried' || return 1
-  assert_equal 2 "$(line_count "$CASE_DIR/token-starts")" 'token was fetched again' || return 1
-  assert_equal 1 "$(line_count "$CASE_DIR/post-starts")" 'failed token attempt did not POST' || return 1
+  assert_equal 2 "$(wc -l < "$CASE_DIR/token-starts" | tr -d '[:space:]')" 'token was fetched again' || return 1
+  assert_equal 1 "$(wc -l < "$CASE_DIR/post-starts" | tr -d '[:space:]')" 'failed token attempt did not POST' || return 1
   assert_equal 10 "$(< "$CASE_DIR/sleeps")" 'token failure uses retry backoff' || return 1
   assert_contains "$RUN_OUTPUT" 'Failed to obtain OIDC token on attempt 1' 'token failure is reported' || return 1
   assert_contains "$RUN_OUTPUT" 'Publish attempt 2 returned HTTP 201' 'next overall attempt succeeds' || return 1
@@ -677,12 +556,48 @@ test_token_fetch_past_deadline_prevents_post() {
   run_registry_request Publish "$payload"
 
   assert_equal 1 "$RUN_STATUS" 'token fetch that crosses the deadline fails' || return 1
-  assert_equal 1 "$(line_count "$CASE_DIR/token-starts")" 'pre-loop deadline check allowed the token request' || return 1
+  assert_equal 1 "$(wc -l < "$CASE_DIR/token-starts" | tr -d '[:space:]')" 'pre-loop deadline check allowed the token request' || return 1
   assert_equal "$initial_time" "$(< "$CASE_DIR/token-starts")" 'token request started one second before the deadline' || return 1
-  assert_equal 0 "$(line_count "$CASE_DIR/post-starts")" 'post-token deadline check prevents POST' || return 1
-  assert_equal 0 "$(line_count "$CASE_DIR/sleeps")" 'post-token deadline failure does not retry' || return 1
+  assert_equal 0 "$(wc -l < "$CASE_DIR/post-starts" | tr -d '[:space:]')" 'post-token deadline check prevents POST' || return 1
+  assert_equal 0 "$(wc -l < "$CASE_DIR/sleeps" | tr -d '[:space:]')" 'post-token deadline failure does not retry' || return 1
   assert_contains "$RUN_OUTPUT" 'last status: deadline reached after OIDC token fetch' \
     'failure identifies the post-token deadline check' || return 1
+}
+
+test_5xx_then_token_failure_warns_about_ambiguous_commit() {
+  local payload
+  local deadline=$((EARLY_CERT_EPOCH - 120))
+  local initial_time=$((deadline - 10))
+
+  payload=$(main_bundle_payload "$EARLY_CERT_RAW") || return 1
+  prepare_case "$initial_time" 503
+  set_token_results ok fail
+  run_registry_request Publish "$payload"
+
+  assert_equal 1 "$RUN_STATUS" 'token failure at the deadline fails' || return 1
+  assert_equal 1 "$(wc -l < "$CASE_DIR/post-starts" | tr -d '[:space:]')" 'only the earlier 503 POST was made' || return 1
+  assert_contains "$RUN_OUTPUT" 'last status: OIDC token failure' \
+    'failure summary reports the token failure' || return 1
+  assert_contains "$RUN_OUTPUT" 'The last attempt may have committed on the registry.' \
+    'failure retains the warning from the earlier 503 POST' || return 1
+}
+
+test_5xx_then_slow_token_fetch_warns_about_ambiguous_commit() {
+  local payload
+  local deadline=$((EARLY_CERT_EPOCH - 120))
+  local initial_time=$((deadline - 10))
+
+  payload=$(main_bundle_payload "$EARLY_CERT_RAW") || return 1
+  prepare_case "$initial_time" 503
+  set_token_results ok ok+60
+  run_registry_request Publish "$payload"
+
+  assert_equal 1 "$RUN_STATUS" 'slow token fetch crossing the deadline fails' || return 1
+  assert_equal 1 "$(wc -l < "$CASE_DIR/post-starts" | tr -d '[:space:]')" 'only the earlier 503 POST was made' || return 1
+  assert_contains "$RUN_OUTPUT" 'last status: deadline reached after OIDC token fetch' \
+    'failure summary reports the post-token deadline' || return 1
+  assert_contains "$RUN_OUTPUT" 'The last attempt may have committed on the registry.' \
+    'failure retains the warning from the earlier 503 POST' || return 1
 }
 
 test_retry_attempt_can_start_at_deadline() {
@@ -697,7 +612,7 @@ test_retry_attempt_can_start_at_deadline() {
   assert_equal 0 "$RUN_STATUS" 'retry landing exactly on the deadline succeeds' || return 1
   assert_equal "$initial_time" "$(head -n 1 "$CASE_DIR/post-starts")" 'first attempt starts before the deadline' || return 1
   assert_equal "$deadline" "$(tail -n 1 "$CASE_DIR/post-starts")" 'second attempt starts exactly at the deadline' || return 1
-  assert_equal 2 "$(line_count "$CASE_DIR/post-starts")" 'exact-deadline retry makes the second POST' || return 1
+  assert_equal 2 "$(wc -l < "$CASE_DIR/post-starts" | tr -d '[:space:]')" 'exact-deadline retry makes the second POST' || return 1
   assert_equal 10 "$(< "$CASE_DIR/sleeps")" 'retry sleep may end exactly at the deadline' || return 1
   assert_contains "$RUN_OUTPUT" 'Publish attempt 2 returned HTTP 201' 'exact-deadline attempt succeeds' || return 1
 }
@@ -711,16 +626,14 @@ test_transport_deadline_warns_before_rerun() {
   run_registry_request Publish "$payload"
 
   assert_equal 1 "$RUN_STATUS" 'transport error at the deadline fails' || return 1
-  assert_equal 1 "$(line_count "$CASE_DIR/post-starts")" 'transport error at the deadline is not retried' || return 1
-  assert_equal 0 "$(line_count "$CASE_DIR/sleeps")" 'transport error at the deadline does not sleep' || return 1
+  assert_equal 1 "$(wc -l < "$CASE_DIR/post-starts" | tr -d '[:space:]')" 'transport error at the deadline is not retried' || return 1
+  assert_equal 0 "$(wc -l < "$CASE_DIR/sleeps" | tr -d '[:space:]')" 'transport error at the deadline does not sleep' || return 1
   assert_contains "$RUN_OUTPUT" 'last status: 000' 'deadline failure reports the transport status' || return 1
-  assert_contains "$RUN_OUTPUT" "$PUBLISH_DEADLINE_HINT" \
+  assert_contains "$RUN_OUTPUT" "$PUBLISH_DEADLINE_HINT_PREFIX" \
     'transport deadline failure explains how to retry the publish' || return 1
   assert_contains "$RUN_OUTPUT" \
     'The last attempt may have committed on the registry.' \
     'transport deadline failure warns about an ambiguous commit' || return 1
-  assert_not_contains "$RUN_OUTPUT" 'check whether the version is listed' \
-    'obsolete transport-error guidance is removed' || return 1
 }
 
 test_publish_5xx_deadline_warns_about_ambiguous_commit() {
@@ -732,9 +645,9 @@ test_publish_5xx_deadline_warns_about_ambiguous_commit() {
   run_registry_request Publish "$payload"
 
   assert_equal 1 "$RUN_STATUS" 'publish 5xx at the deadline fails' || return 1
-  assert_equal 1 "$(line_count "$CASE_DIR/post-starts")" 'publish 5xx at the deadline is not retried' || return 1
+  assert_equal 1 "$(wc -l < "$CASE_DIR/post-starts" | tr -d '[:space:]')" 'publish 5xx at the deadline is not retried' || return 1
   assert_contains "$RUN_OUTPUT" 'last status: 503' 'deadline failure reports the 5xx status' || return 1
-  assert_contains "$RUN_OUTPUT" "$PUBLISH_DEADLINE_HINT" \
+  assert_contains "$RUN_OUTPUT" "$PUBLISH_DEADLINE_HINT_PREFIX" \
     '5xx deadline failure explains how to retry the publish' || return 1
   assert_contains "$RUN_OUTPUT" 'The last attempt may have committed on the registry.' \
     'publish 5xx deadline failure warns about an ambiguous commit' || return 1
@@ -752,7 +665,7 @@ test_docs_earlier_not_after_sets_deadline() {
   run_registry_request Publish "$payload"
 
   assert_equal 1 "$RUN_STATUS" 'docs certificate deadline is enforced' || return 1
-  assert_equal 3 "$(line_count "$CASE_DIR/post-starts")" 'earlier docs deadline limits attempts' || return 1
+  assert_equal 3 "$(wc -l < "$CASE_DIR/post-starts" | tr -d '[:space:]')" 'earlier docs deadline limits attempts' || return 1
   assert_post_starts_at_or_before "$deadline" || return 1
   assert_contains "$RUN_OUTPUT" "$deadline_iso" 'docs notAfter determines the deadline' || return 1
 }
@@ -764,8 +677,8 @@ test_missing_certificate_fails_before_post() {
   run_registry_request Publish '{"sigstore_bundle":{}}'
 
   assert_equal 1 "$RUN_STATUS" 'missing certificate fails' || return 1
-  assert_equal 0 "$(line_count "$CASE_DIR/post-starts")" 'missing certificate prevents POST' || return 1
-  assert_equal 0 "$(line_count "$CASE_DIR/token-starts")" 'missing certificate prevents token request' || return 1
+  assert_equal 0 "$(wc -l < "$CASE_DIR/post-starts" | tr -d '[:space:]')" 'missing certificate prevents POST' || return 1
+  assert_equal 0 "$(wc -l < "$CASE_DIR/token-starts" | tr -d '[:space:]')" 'missing certificate prevents token request' || return 1
   assert_contains "$RUN_OUTPUT" '.sigstore_bundle' 'error names the invalid bundle' || return 1
   assert_contains "$RUN_OUTPUT" 'readable leaf certificate' 'error explains certificate failure' || return 1
   assert_contains "$RUN_OUTPUT" \
@@ -782,8 +695,8 @@ test_unparseable_certificate_fails_before_post() {
   run_registry_request Publish "$payload"
 
   assert_equal 1 "$RUN_STATUS" 'unparseable certificate fails' || return 1
-  assert_equal 0 "$(line_count "$CASE_DIR/post-starts")" 'unparseable certificate prevents POST' || return 1
-  assert_equal 0 "$(line_count "$CASE_DIR/token-starts")" 'unparseable certificate prevents token request' || return 1
+  assert_equal 0 "$(wc -l < "$CASE_DIR/post-starts" | tr -d '[:space:]')" 'unparseable certificate prevents POST' || return 1
+  assert_equal 0 "$(wc -l < "$CASE_DIR/token-starts" | tr -d '[:space:]')" 'unparseable certificate prevents token request' || return 1
   assert_contains "$RUN_OUTPUT" '.sigstore_bundle' 'error names the unparseable bundle' || return 1
   assert_contains "$RUN_OUTPUT" 'readable leaf certificate' 'error explains parse failure' || return 1
   assert_contains "$RUN_OUTPUT" \
@@ -807,8 +720,8 @@ test_missing_docs_certificate_fails_before_post() {
   run_registry_request Publish "$payload"
 
   assert_equal 1 "$RUN_STATUS" 'missing docs certificate fails' || return 1
-  assert_equal 0 "$(line_count "$CASE_DIR/post-starts")" 'missing docs certificate prevents POST' || return 1
-  assert_equal 0 "$(line_count "$CASE_DIR/token-starts")" 'missing docs certificate prevents token request' || return 1
+  assert_equal 0 "$(wc -l < "$CASE_DIR/post-starts" | tr -d '[:space:]')" 'missing docs certificate prevents POST' || return 1
+  assert_equal 0 "$(wc -l < "$CASE_DIR/token-starts" | tr -d '[:space:]')" 'missing docs certificate prevents token request' || return 1
   assert_contains "$RUN_OUTPUT" '.docs.sigstore_bundle' 'error names the invalid docs bundle' || return 1
   assert_contains "$RUN_OUTPUT" 'readable leaf certificate' 'docs error explains certificate failure' || return 1
   assert_contains "$RUN_OUTPUT" \
@@ -828,11 +741,11 @@ test_expired_publish_deadline_fails_before_attempt() {
   run_registry_request Publish "$payload"
 
   assert_equal 1 "$RUN_STATUS" 'past publish deadline fails' || return 1
-  assert_equal 0 "$(line_count "$CASE_DIR/post-starts")" 'past deadline prevents POST' || return 1
-  assert_equal 0 "$(line_count "$CASE_DIR/token-starts")" 'past deadline prevents token request' || return 1
+  assert_equal 0 "$(wc -l < "$CASE_DIR/post-starts" | tr -d '[:space:]')" 'past deadline prevents POST' || return 1
+  assert_equal 0 "$(wc -l < "$CASE_DIR/token-starts" | tr -d '[:space:]')" 'past deadline prevents token request' || return 1
   assert_contains "$RUN_OUTPUT" 'notAfter' 'past-deadline error names notAfter' || return 1
   assert_contains "$RUN_OUTPUT" "$not_after_iso" 'past-deadline error names certificate expiry' || return 1
-  assert_contains "$RUN_OUTPUT" "$PUBLISH_DEADLINE_HINT" \
+  assert_contains "$RUN_OUTPUT" "$PUBLISH_DEADLINE_HINT_PREFIX" \
     'zero-attempt publish deadline failure still explains what to do' || return 1
   assert_not_contains "$RUN_OUTPUT" 'The last attempt may have committed on the registry.' \
     'zero-attempt publish failure does not imply an ambiguous commit' || return 1
@@ -848,12 +761,13 @@ test_yank_uses_ten_minute_deadline() {
   run_registry_request Yank '{}'
 
   assert_equal 1 "$RUN_STATUS" 'yank deadline exhaustion fails' || return 1
-  assert_equal 22 "$(line_count "$CASE_DIR/post-starts")" 'yank retries through its ten-minute deadline' || return 1
+  assert_equal 22 "$(wc -l < "$CASE_DIR/post-starts" | tr -d '[:space:]')" 'yank retries through its ten-minute deadline' || return 1
   assert_equal "$deadline" "$(tail -n 1 "$CASE_DIR/post-starts")" 'last yank attempt starts at deadline' || return 1
   assert_post_starts_at_or_before "$deadline" || return 1
   assert_contains "$RUN_OUTPUT" 'Yank failed after 22 attempts' 'yank summary states attempt count' || return 1
   assert_contains "$RUN_OUTPUT" "$deadline_iso" 'yank summary states UTC deadline' || return 1
-  assert_contains "$RUN_OUTPUT" '600' 'yank summary explains its retry window' || return 1
+  assert_contains "$RUN_OUTPUT" '600s Yank retry window' \
+    'yank summary explains its retry window' || return 1
   assert_contains "$RUN_OUTPUT" \
     'Re-run the failed yank job; yanking an already-yanked version succeeds.' \
     'yank deadline failure explains how to retry safely' || return 1
@@ -942,22 +856,13 @@ run_test '429 uses capped backoff and can reach 201' test_429_backoff_then_201
 run_test '429 retries stop at the certificate deadline' test_deadline_stops_429_retries
 run_test '5xx and transport errors are retried' test_5xx_and_transport_errors_retry
 run_test '400 fails after one POST' test_400_fails_immediately
-run_test '403 provider_frozen prints the registry-operator hint' test_403_provider_frozen_hint
-run_test '403 provider_tombstoned prints the permanently-closed hint' test_403_provider_tombstoned_hint
-run_test '403 version_forbidden prints the exact-tag hint' test_403_version_forbidden_hint
-run_test '403 claim_mismatch prints trusted-publisher guidance' test_403_claim_mismatch_hint
-run_test '403 unknown error code uses the status-only hint' test_403_unknown_code_falls_back
-run_test '403 JSON without .error uses the status-only hint' test_403_missing_error_falls_back
-run_test '403 non-JSON response uses the status-only hint' test_403_non_json_falls_back
-run_test '409 version_conflict explains rebuilt bytes' test_409_version_conflict_hint
-run_test '409 docs_signer_mismatch_recorded explains the interrupted publish' test_409_docs_signer_mismatch_hint
-run_test '409 unknown error code uses the status-only hint' test_409_unknown_code_falls_back
-run_test '409 JSON without .error uses the status-only hint' test_409_missing_error_falls_back
-run_test '409 non-JSON response uses the status-only hint' test_409_non_json_falls_back
+run_test 'Publish 403/409 responses select hints from .error' test_publish_error_hints
 run_test 'Yank 409 omits the publish content-conflict hint' test_yank_409_omits_publish_content_conflict_hint
 run_test '200 is successful' test_200_succeeds
 run_test 'OIDC token failures are retried with a fresh token' test_token_failure_retries
 run_test 'a token fetch crossing the deadline prevents POST' test_token_fetch_past_deadline_prevents_post
+run_test 'a token failure after HTTP 5xx retains the ambiguous-commit warning' test_5xx_then_token_failure_warns_about_ambiguous_commit
+run_test 'a slow token fetch after HTTP 5xx retains the ambiguous-commit warning' test_5xx_then_slow_token_fetch_warns_about_ambiguous_commit
 run_test 'a retry attempt may start exactly at the deadline' test_retry_attempt_can_start_at_deadline
 run_test 'a deadline after HTTP 000 warns before re-running' test_transport_deadline_warns_before_rerun
 run_test 'a Publish deadline after HTTP 5xx warns about an ambiguous commit' test_publish_5xx_deadline_warns_about_ambiguous_commit

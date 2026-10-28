@@ -12,13 +12,6 @@ now() {
   date +%s
 }
 
-can_start_by() {
-  local deadline=$1
-  local candidate_time=$2
-
-  [ "$candidate_time" -le "$deadline" ]
-}
-
 certificate_date_to_epoch() {
   local certificate_date=$1
   local timestamp
@@ -69,14 +62,7 @@ bundle_certificate_not_after_epoch() {
       | openssl x509 -inform DER -noout -enddate 2>/dev/null); then
       continue
     fi
-    case "$not_after" in
-      notAfter=*)
-        not_after=${not_after#notAfter=}
-        ;;
-      *)
-        continue
-        ;;
-    esac
+    not_after=${not_after#notAfter=}
     if not_after_epoch=$(certificate_date_to_epoch "$not_after"); then
       printf '%s\n' "$not_after_epoch"
       return
@@ -89,11 +75,9 @@ bundle_certificate_not_after_epoch() {
 wait_then_advance_backoff() {
   local deadline=$1
   local requested_sleep=$2
-  local backoff_variable=$3
   local current_time
   local remaining_time
   local sleep_time
-  local next_backoff
 
   current_time=$(now) || return 1
   remaining_time=$((deadline - current_time))
@@ -105,25 +89,21 @@ wait_then_advance_backoff() {
   if [ "$sleep_time" -gt "$remaining_time" ]; then
     sleep_time=$remaining_time
   fi
-  if [ "$sleep_time" -le 0 ] \
-    || ! can_start_by "$deadline" "$((current_time + sleep_time))"; then
-    return 1
-  fi
   sleep "$sleep_time" || return 1
 
-  next_backoff=$((requested_sleep + RETRY_BACKOFF_STEP_SECONDS))
-  if [ "$next_backoff" -gt "$RETRY_BACKOFF_MAX_SECONDS" ]; then
-    next_backoff=$RETRY_BACKOFF_MAX_SECONDS
+  retry_delay=$((requested_sleep + RETRY_BACKOFF_STEP_SECONDS))
+  if [ "$retry_delay" -gt "$RETRY_BACKOFF_MAX_SECONDS" ]; then
+    retry_delay=$RETRY_BACKOFF_MAX_SECONDS
   fi
-  printf -v "$backoff_variable" '%s' "$next_backoff"
 }
 
-print_deadline_failure() {
+fail_deadline() {
   local operation=$1
   local attempts=$2
   local last_status=$3
-  local deadline=$4
-  local deadline_reason=$5
+  local last_http_status=$4
+  local deadline=$5
+  local deadline_reason=$6
   local deadline_iso
 
   deadline_iso=$(epoch_to_iso8601 "$deadline")
@@ -143,11 +123,12 @@ print_deadline_failure() {
       printf 'Re-run the failed yank job; yanking an already-yanked version succeeds.\n' >&2
       ;;
   esac
-  case "$last_status" in
+  case "$last_http_status" in
     000|5??)
       printf 'The last attempt may have committed on the registry.\n' >&2
       ;;
   esac
+  exit 1
 }
 
 validate_release_tag() {
@@ -178,6 +159,7 @@ registry_request() {
   local attempt=0
   local retry_delay=$RETRY_BACKOFF_START_SECONDS
   local last_status='not attempted'
+  local last_http_status='not attempted'
   local token
   local status
   local error_code
@@ -229,9 +211,9 @@ registry_request() {
   # Retry only while an attempt can start by the operation-specific deadline.
   while :; do
     current_time=$(now)
-    if ! can_start_by "$deadline" "$current_time"; then
-      print_deadline_failure "$operation" "$attempt" "$last_status" "$deadline" "$deadline_reason"
-      exit 1
+    if [ "$current_time" -gt "$deadline" ]; then
+      fail_deadline "$operation" "$attempt" "$last_status" "$last_http_status" \
+        "$deadline" "$deadline_reason"
     fi
     attempt=$((attempt + 1))
 
@@ -243,18 +225,18 @@ registry_request() {
       | jq -er .value) || [ -z "$token" ]; then
       printf 'Failed to obtain OIDC token on attempt %s\n' "$attempt" >&2
       last_status='OIDC token failure'
-      if wait_then_advance_backoff "$deadline" "$retry_delay" retry_delay; then
+      if wait_then_advance_backoff "$deadline" "$retry_delay"; then
         continue
       fi
-      print_deadline_failure "$operation" "$attempt" "$last_status" "$deadline" "$deadline_reason"
-      exit 1
+      fail_deadline "$operation" "$attempt" "$last_status" "$last_http_status" \
+        "$deadline" "$deadline_reason"
     fi
 
     current_time=$(now)
-    if ! can_start_by "$deadline" "$current_time"; then
+    if [ "$current_time" -gt "$deadline" ]; then
       last_status='deadline reached after OIDC token fetch'
-      print_deadline_failure "$operation" "$attempt" "$last_status" "$deadline" "$deadline_reason"
-      exit 1
+      fail_deadline "$operation" "$attempt" "$last_status" "$last_http_status" \
+        "$deadline" "$deadline_reason"
     fi
 
     : > "$response_file"
@@ -275,61 +257,46 @@ registry_request() {
     sed 's/^/  /' "$response_file"
     printf '\n'
     last_status=$status
-    error_code=
-    if ! error_code=$(jq -er '.error | select(type == "string" and length > 0)' \
-      "$response_file" 2>/dev/null); then
-      error_code=
-    fi
+    last_http_status=$status
 
     case "$status" in
       200|201)
         exit 0
         ;;
       000|429|5??)
-        if wait_then_advance_backoff "$deadline" "$retry_delay" retry_delay; then
+        if wait_then_advance_backoff "$deadline" "$retry_delay"; then
           continue
         fi
-        print_deadline_failure "$operation" "$attempt" "$last_status" "$deadline" "$deadline_reason"
-        exit 1
-        ;;
-      403)
-        printf '%s failed with non-retryable status %s\n' "$operation" "$status" >&2
-        case "$error_code" in
-          provider_frozen)
-            printf 'Hint: not a config problem: the provider is frozen pending registry-operator review.\n' >&2
-            ;;
-          provider_tombstoned)
-            printf 'Hint: the name is permanently closed.\n' >&2
-            ;;
-          version_forbidden)
-            printf 'Hint: the tag must be exactly v<version>.\n' >&2
-            ;;
-          # claim_mismatch, missing .error, and unknown codes retain the config hint.
-          *)
-            printf "Hint: check release-tag-environment mode, environment \`release\`, and that the trusted-publisher policy points at the caller's .github/workflows/release.yml.\n" >&2
-            ;;
-        esac
-        exit 1
-        ;;
-      409)
-        printf '%s failed with non-retryable status %s\n' "$operation" "$status" >&2
-        if [ "$operation" = Publish ]; then
-          case "$error_code" in
-            version_conflict)
-              printf 'Hint: the version exists with different bytes (often because a whole-workflow rerun rebuilt the docs); only a new version fixes it now.\n' >&2
-              ;;
-            docs_signer_mismatch_recorded)
-              printf 'Hint: a previous attempt was interrupted after recording the artifact signature; this version cannot get docs, so publish a new version.\n' >&2
-              ;;
-            *)
-              printf 'Hint: the version exists with different bytes; only a new version fixes it now.\n' >&2
-              ;;
-          esac
-        fi
-        exit 1
+        fail_deadline "$operation" "$attempt" "$last_status" "$last_http_status" \
+          "$deadline" "$deadline_reason"
         ;;
       4??)
         printf '%s failed with non-retryable status %s\n' "$operation" "$status" >&2
+        error_code=$(jq -r 'try .error | strings' "$response_file" 2>/dev/null || true)
+        case "$operation:$status:$error_code" in
+          *:403:provider_frozen)
+            printf 'Hint: not a config problem: the provider is frozen pending registry-operator review.\n' >&2
+            ;;
+          *:403:provider_tombstoned)
+            printf 'Hint: the name is permanently closed.\n' >&2
+            ;;
+          *:403:version_forbidden)
+            printf 'Hint: the tag must be exactly v<version>.\n' >&2
+            ;;
+          # claim_mismatch, missing .error, and unknown codes retain the config hint.
+          *:403:*)
+            printf "Hint: check release-tag-environment mode, environment \`release\`, and that the trusted-publisher policy points at the caller's .github/workflows/release.yml.\n" >&2
+            ;;
+          Publish:409:version_conflict)
+            printf 'Hint: the version exists with different bytes (often because a whole-workflow rerun rebuilt the docs); only a new version fixes it now.\n' >&2
+            ;;
+          Publish:409:docs_signer_mismatch_recorded)
+            printf 'Hint: a previous attempt was interrupted after recording the artifact signature; this version cannot get docs, so publish a new version.\n' >&2
+            ;;
+          Publish:409:*)
+            printf 'Hint: the version exists with different bytes; only a new version fixes it now.\n' >&2
+            ;;
+        esac
         exit 1
         ;;
       *)
