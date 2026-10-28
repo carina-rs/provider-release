@@ -17,7 +17,7 @@ runs:
       shell: bash
       env:
         REGISTRY_REQUEST: ${{ github.action_path }}/../scripts/registry-request.sh
-      run: '"$REGISTRY_REQUEST" validate'
+      run: 'bash "$REGISTRY_REQUEST" validate'
 
     - name: Yank from Carina Registry
       shell: bash
@@ -41,4 +41,4 @@ runs:
             name: $name,
             version: $version
           }')
-        "$REGISTRY_REQUEST" request Yank "$payload"
+        bash "$REGISTRY_REQUEST" request Yank "$payload"

@@ -83,9 +83,10 @@ the example only after reviewing the target commit's diff.
 
 ## Security
 
-Composite actions run with the caller job's permissions and secrets. The publish
-and yank jobs hold `id-token: write`, so any action they run can mint a registry
-OIDC token for that provider. Pin this repository by full commit SHA and review the
-diff before every bump. Keep `id-token: write` off the build and GitHub release
-jobs. The registry audience and write endpoints are fixed by the actions so a
-registry-scoped token cannot be redirected to another host.
+Composite actions run with the caller job's permissions, environment variables,
+`GITHUB_TOKEN`, and OIDC request credentials. In a job with `id-token: write`, any
+action can therefore mint a registry OIDC token for that provider. Pin this
+repository by full commit SHA and review the diff before every bump. Keep
+`id-token: write` off the build and GitHub release jobs. The registry audience and
+write endpoints are fixed by the actions so a registry-scoped token cannot be
+redirected to another host.

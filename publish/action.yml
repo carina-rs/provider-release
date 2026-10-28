@@ -20,7 +20,7 @@ runs:
       shell: bash
       env:
         REGISTRY_REQUEST: ${{ github.action_path }}/../scripts/registry-request.sh
-      run: '"$REGISTRY_REQUEST" validate'
+      run: 'bash "$REGISTRY_REQUEST" validate'
 
     - name: Download WASM Artifact
       uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -128,4 +128,4 @@ runs:
             candidate_download_url: $asset_url,
             sigstore_bundle: $bundle[0]
           } + if $docs == null then {} else {docs: $docs} end')
-        "$REGISTRY_REQUEST" request Publish "$payload"
+        bash "$REGISTRY_REQUEST" request Publish "$payload"
