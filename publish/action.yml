@@ -69,13 +69,17 @@ runs:
           done
         }
 
-        # Sign docs first so the WASM certificate stays freshest for the publish retry loop.
+        # The publish retry deadline is set by the earlier of the two certificates'
+        # notAfter, so keep signing both right before publishing.
         sign_blob "${PROVIDER}-${GITHUB_REF_NAME}-docs.tar.gz" docs-sigstore-bundle.json
         sign_blob "${PROVIDER}-${GITHUB_REF_NAME}.wasm" sigstore-bundle.json
 
     - name: Publish to Carina Registry
       # If publishing fails, re-run only this failed job. Re-running the whole workflow
       # rebuilds docs with a different digest, which the registry rejects with a 409.
+      # If an attempt was interrupted after the registry recorded the artifact signature
+      # but not the docs signature, the rerun gets 409 docs_signer_mismatch_recorded;
+      # publish a new version instead.
       # For a 403 claim_mismatch, verify release-tag-environment mode and environment
       # `release`. The trusted-publisher policy must point at the CALLER's
       # .github/workflows/release.yml.
