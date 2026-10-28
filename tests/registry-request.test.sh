@@ -117,10 +117,16 @@ if $is_post; then
   else
     printf 'response-%s-attempt-%s\n' "$result" "$count" > "$response_file"
   fi
-  if [ "$result" = 000 ]; then
-    printf '000'
-    exit 7
-  fi
+  case "$result" in
+    000)
+      printf '000'
+      exit 7
+      ;;
+    *-exit28)
+      printf '%s' "${result%-exit28}"
+      exit 28
+      ;;
+  esac
   printf '%s' "$result"
   exit 0
 fi
@@ -145,6 +151,9 @@ case "$result" in
     ;;
   fail)
     exit 7
+    ;;
+  empty)
+    printf '{"value":""}\n'
     ;;
   *)
     printf 'unsupported token stub result: %s\n' "$result" >&2
@@ -440,6 +449,28 @@ test_5xx_and_transport_errors_retry() {
   assert_contains "$RUN_OUTPUT" 'Publish attempt 3 returned HTTP 503' '503 is reported' || return 1
 }
 
+test_http_code_from_timed_out_post_is_transport_error() {
+  local payload
+  local deadline=$((EARLY_CERT_EPOCH - 120))
+  local initial_time=$((deadline - 10))
+
+  payload=$(main_bundle_payload "$EARLY_CERT_RAW") || return 1
+  prepare_case "$initial_time" 503-exit28 200-exit28
+  run_registry_request Publish "$payload"
+
+  assert_equal 1 "$RUN_STATUS" 'a timeout after HTTP response headers fails at the deadline' || return 1
+  assert_equal 2 "$(wc -l < "$CASE_DIR/post-starts" | tr -d '[:space:]')" 'the timed-out 503 is retried' || return 1
+  assert_equal 10 "$(< "$CASE_DIR/sleeps")" 'the timed-out 503 uses retry backoff' || return 1
+  assert_contains "$RUN_OUTPUT" 'Publish attempt 1 returned HTTP 000' \
+    'a 503 followed by curl exit 28 is reported as a transport error' || return 1
+  assert_contains "$RUN_OUTPUT" 'Publish attempt 2 returned HTTP 000' \
+    'a 200 followed by curl exit 28 is not treated as success' || return 1
+  assert_contains "$RUN_OUTPUT" 'last status: 000' \
+    'the deadline failure retains the transport status' || return 1
+  assert_contains "$RUN_OUTPUT" 'The last attempt may have committed on the registry.' \
+    'the deadline failure warns about an ambiguous commit' || return 1
+}
+
 test_400_fails_immediately() {
   local payload
   local initial_time=$((EARLY_CERT_EPOCH - 120 - 300))
@@ -451,6 +482,26 @@ test_400_fails_immediately() {
   assert_equal 1 "$RUN_STATUS" '400 fails' || return 1
   assert_equal 1 "$(wc -l < "$CASE_DIR/post-starts" | tr -d '[:space:]')" '400 is not retried' || return 1
   assert_equal 0 "$(wc -l < "$CASE_DIR/sleeps" | tr -d '[:space:]')" '400 does not sleep' || return 1
+}
+
+test_unexpected_statuses_fail_immediately() {
+  local payload
+  local initial_time=$((EARLY_CERT_EPOCH - 120 - 300))
+  local status
+
+  payload=$(main_bundle_payload "$EARLY_CERT_RAW") || return 1
+  for status in 302 204; do
+    prepare_case "$initial_time" "$status" 201
+    run_registry_request Publish "$payload"
+
+    assert_equal 1 "$RUN_STATUS" "unexpected HTTP $status fails" || return 1
+    assert_equal 1 "$(wc -l < "$CASE_DIR/post-starts" | tr -d '[:space:]')" \
+      "unexpected HTTP $status makes one POST" || return 1
+    assert_equal 0 "$(wc -l < "$CASE_DIR/sleeps" | tr -d '[:space:]')" \
+      "unexpected HTTP $status is not retried" || return 1
+    assert_contains "$RUN_OUTPUT" "Publish failed with unexpected status $status" \
+      "HTTP $status reaches the unexpected-status branch" || return 1
+  done
 }
 
 assert_publish_error_hint() {
@@ -543,6 +594,29 @@ test_token_failure_retries() {
   assert_equal 10 "$(< "$CASE_DIR/sleeps")" 'token failure uses retry backoff' || return 1
   assert_contains "$RUN_OUTPUT" 'Failed to obtain OIDC token on attempt 1' 'token failure is reported' || return 1
   assert_contains "$RUN_OUTPUT" 'Publish attempt 2 returned HTTP 201' 'next overall attempt succeeds' || return 1
+}
+
+test_empty_token_retries_without_post() {
+  local payload
+  local initial_time=$((EARLY_CERT_EPOCH - 120 - 300))
+
+  payload=$(main_bundle_payload "$EARLY_CERT_RAW") || return 1
+  prepare_case "$initial_time" 201
+  set_token_results empty ok
+  run_registry_request Publish "$payload"
+
+  assert_equal 0 "$RUN_STATUS" 'an empty token value is retried' || return 1
+  assert_equal 2 "$(wc -l < "$CASE_DIR/token-starts" | tr -d '[:space:]')" \
+    'an empty token value triggers a fresh token request' || return 1
+  assert_equal 1 "$(wc -l < "$CASE_DIR/post-starts" | tr -d '[:space:]')" \
+    'an empty token value does not trigger a POST' || return 1
+  assert_equal 'Authorization: Bearer token-2' "$(< "$CASE_DIR/post-authorizations")" \
+    'the only POST uses the replacement token' || return 1
+  assert_equal 10 "$(< "$CASE_DIR/sleeps")" 'an empty token value uses retry backoff' || return 1
+  assert_contains "$RUN_OUTPUT" 'Failed to obtain OIDC token on attempt 1' \
+    'an empty token value is reported as a token failure' || return 1
+  assert_contains "$RUN_OUTPUT" 'Publish attempt 2 returned HTTP 201' \
+    'the retry after an empty token succeeds' || return 1
 }
 
 test_token_fetch_past_deadline_prevents_post() {
@@ -733,8 +807,10 @@ test_expired_publish_deadline_fails_before_attempt() {
   local payload
   local deadline=$((EARLY_CERT_EPOCH - 120))
   local initial_time=$((deadline + 1))
+  local deadline_iso
   local not_after_iso
 
+  deadline_iso=$(epoch_to_iso8601 "$deadline") || return 1
   not_after_iso=$(epoch_to_iso8601 "$EARLY_CERT_EPOCH") || return 1
   payload=$(main_bundle_payload "$EARLY_CERT_RAW") || return 1
   prepare_case "$initial_time" 201
@@ -743,6 +819,9 @@ test_expired_publish_deadline_fails_before_attempt() {
   assert_equal 1 "$RUN_STATUS" 'past publish deadline fails' || return 1
   assert_equal 0 "$(wc -l < "$CASE_DIR/post-starts" | tr -d '[:space:]')" 'past deadline prevents POST' || return 1
   assert_equal 0 "$(wc -l < "$CASE_DIR/token-starts" | tr -d '[:space:]')" 'past deadline prevents token request' || return 1
+  assert_contains "$RUN_OUTPUT" \
+    "Publish failed after 0 attempts (last status: not attempted): retry deadline $deadline_iso has already passed before the first attempt; it is the earliest bundle certificate notAfter $not_after_iso minus the 120s registry verification margin" \
+    'past-deadline failure uses the zero-attempt wording' || return 1
   assert_contains "$RUN_OUTPUT" 'notAfter' 'past-deadline error names notAfter' || return 1
   assert_contains "$RUN_OUTPUT" "$not_after_iso" 'past-deadline error names certificate expiry' || return 1
   assert_contains "$RUN_OUTPUT" "$PUBLISH_DEADLINE_HINT_PREFIX" \
@@ -855,11 +934,14 @@ run_test() {
 run_test '429 uses capped backoff and can reach 201' test_429_backoff_then_201
 run_test '429 retries stop at the certificate deadline' test_deadline_stops_429_retries
 run_test '5xx and transport errors are retried' test_5xx_and_transport_errors_retry
+run_test 'HTTP output followed by curl exit 28 remains a transport error' test_http_code_from_timed_out_post_is_transport_error
 run_test '400 fails after one POST' test_400_fails_immediately
+run_test '302 and 204 fail through the unexpected-status branch' test_unexpected_statuses_fail_immediately
 run_test 'Publish 403/409 responses select hints from .error' test_publish_error_hints
 run_test 'Yank 409 omits the publish content-conflict hint' test_yank_409_omits_publish_content_conflict_hint
 run_test '200 is successful' test_200_succeeds
 run_test 'OIDC token failures are retried with a fresh token' test_token_failure_retries
+run_test 'an empty OIDC token is retried without an empty-bearer POST' test_empty_token_retries_without_post
 run_test 'a token fetch crossing the deadline prevents POST' test_token_fetch_past_deadline_prevents_post
 run_test 'a token failure after HTTP 5xx retains the ambiguous-commit warning' test_5xx_then_token_failure_warns_about_ambiguous_commit
 run_test 'a slow token fetch after HTTP 5xx retains the ambiguous-commit warning' test_5xx_then_slow_token_fetch_warns_about_ambiguous_commit

@@ -272,7 +272,7 @@ registry_request() {
         ;;
       4??)
         printf '%s failed with non-retryable status %s\n' "$operation" "$status" >&2
-        error_code=$(jq -r 'try .error | strings' "$response_file" 2>/dev/null || true)
+        error_code=$(jq -r '.error // empty' "$response_file" 2>/dev/null || true)
         case "$operation:$status:$error_code" in
           *:403:provider_frozen)
             printf 'Hint: not a config problem: the provider is frozen pending registry-operator review.\n' >&2
