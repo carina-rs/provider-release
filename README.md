@@ -29,7 +29,11 @@ The provider repository must:
   keep its `build <archive>` and `check <archive>` commands, set `GENERATED_DOCS`
   to your docs directory, and adjust its `generated-docs/aws` error messages. It
   reads `docs/registry/index.md` as the bundle's index page (provide it or change
-  `INDEX_SOURCE`), while `check` enforces the registry's docs bundle rules;
+  `INDEX_SOURCE`), while `check` enforces the registry's docs bundle rules.
+  A bundle may also carry an optional root `services.json` that groups the
+  pages by service for the docs sidebar; see the registry protocol,
+  ["Documentation source: the docs bundle"](https://github.com/carina-rs/registry/blob/main/docs/protocol.md#documentation-source-the-docs-bundle).
+  A bundle without it is shown with a flat Resources and Data Sources list;
 - provide `docs-generate`, which generates the docs and should fail when committed
   generated files are stale;
 - define a GitHub environment named `release` and restrict it to `v*` tags; and
