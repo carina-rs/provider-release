@@ -93,8 +93,8 @@ jobs:
 
       - name: Install docs bundle checker
         run: |
-          # This rev must match the deployed production registry; bump both together.
-          cargo install --locked --git https://github.com/carina-rs/registry --rev cf66707c28f6feb31111a72f22e951d02a19dd61 carina-docs-bundle
+          # The rev must equal the carina-docs-bundle revision in the deployed registry's Cargo.lock; bump both together.
+          cargo install --locked --git https://github.com/carina-rs/carina-docs-bundle --rev c6bfdcec781abf0ddb61268e5e7d114717353e4f carina-docs-bundle
 
       - name: Build documentation bundle
         env:
