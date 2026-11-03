@@ -26,10 +26,12 @@ The provider repository must:
 - expose a Cargo binary whose name is the `provider` input;
 - copy
   [`scripts/docs-bundle.py`](https://github.com/carina-rs/carina-provider-aws/blob/main/scripts/docs-bundle.py),
-  keep its `build <archive>` and `check <archive>` commands, set `GENERATED_DOCS`
+  keep its `build <archive>` command, set `GENERATED_DOCS`
   to your docs directory, and adjust its `generated-docs/aws` error messages. It
   reads `docs/registry/index.md` as the bundle's index page (provide it or change
-  `INDEX_SOURCE`), while `check` enforces the registry's docs bundle rules.
+  `INDEX_SOURCE`). The build workflow validates the archive with the registry's own
+  [`carina-docs-bundle` checker](https://github.com/carina-rs/registry/tree/main/crates/carina-docs-bundle),
+  pinned to the deployed registry revision.
   A bundle may also carry an optional root `services.json` that groups the
   pages by service for the docs sidebar; see the registry protocol,
   ["Documentation source: the docs bundle"](https://github.com/carina-rs/registry/blob/main/docs/protocol.md#documentation-source-the-docs-bundle).
@@ -70,6 +72,8 @@ can also resolve in `uses:`. For example, use the GitHub compare view for
 | Input | Required | Default | Description |
 | --- | --- | --- | --- |
 | `provider` | yes | — | Cargo binary name and artifact prefix |
+| `name` | yes | — | Registry provider name |
+| `namespace` | yes | — | Registry namespace |
 | `wasm-toolchain` | no | `stable` | Rust toolchain for the WASM build |
 | `docs-generate` | yes | — | Bash script that generates and verifies docs before bundling |
 
