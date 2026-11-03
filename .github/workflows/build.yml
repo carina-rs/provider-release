@@ -7,6 +7,14 @@ on:
         description: Cargo binary name and artifact prefix
         required: true
         type: string
+      name:
+        description: Provider name in the registry, such as aws
+        required: true
+        type: string
+      namespace:
+        description: Provider namespace in the registry, such as carina-rs
+        required: true
+        type: string
       wasm-toolchain:
         description: Rust toolchain used for the WASM build
         required: false
@@ -83,13 +91,26 @@ jobs:
           printf '%s\n' "$DOCS_GENERATE" > "$script_path"
           bash -e -- "$script_path"
 
+      - name: Install docs bundle checker
+        run: |
+          # This rev must match the deployed production registry; bump both together.
+          cargo install --locked --git https://github.com/carina-rs/registry --rev cf66707c28f6feb31111a72f22e951d02a19dd61 carina-docs-bundle
+
       - name: Build documentation bundle
         env:
           PROVIDER: ${{ inputs.provider }}
+          PROVIDER_NAME: ${{ inputs.name }}
+          PROVIDER_NAMESPACE: ${{ inputs.namespace }}
         run: |
+          set -euo pipefail
+
           bundle="${PROVIDER}-${GITHUB_REF_NAME}-docs.tar.gz"
+          version="${GITHUB_REF_NAME#v}"
+          # Docs publish only for stable versions: check prereleases as releases; pass build metadata through so the checker rejects it like publish.
+          check_version="$version"
+          if [[ "$version" != *+* ]]; then check_version="${version%%-*}"; fi
           python3 scripts/docs-bundle.py build "$bundle"
-          python3 scripts/docs-bundle.py check "$bundle"
+          carina-docs-bundle check "$bundle" --namespace "$PROVIDER_NAMESPACE" --name "$PROVIDER_NAME" --version "$check_version"
 
       - name: Upload artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

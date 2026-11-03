@@ -20,6 +20,9 @@ jobs:
     uses: carina-rs/provider-release/.github/workflows/build.yml@0000000000000000000000000000000000000000
     with:
       provider: carina-provider-example
+      name: example
+      # Registry namespace that owns this provider.
+      namespace: your-namespace
       docs-generate: |
         ./scripts/generate-docs.sh
         docs_status=$(git status --porcelain -- generated-docs)
