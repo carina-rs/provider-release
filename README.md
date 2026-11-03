@@ -30,8 +30,8 @@ The provider repository must:
   to your docs directory, and adjust its `generated-docs/aws` error messages. It
   reads `docs/registry/index.md` as the bundle's index page (provide it or change
   `INDEX_SOURCE`). The build workflow validates the archive with the registry's own
-  [`carina-docs-bundle` checker](https://github.com/carina-rs/registry/tree/main/crates/carina-docs-bundle),
-  pinned to the deployed registry revision.
+  [`carina-docs-bundle` checker](https://github.com/carina-rs/carina-docs-bundle),
+  pinned to the revision the deployed registry uses.
   A bundle may also carry an optional root `services.json` that groups the
   pages by service for the docs sidebar; see the registry protocol,
   ["Documentation source: the docs bundle"](https://github.com/carina-rs/registry/blob/main/docs/protocol.md#documentation-source-the-docs-bundle).
