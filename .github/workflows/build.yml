@@ -4,7 +4,7 @@ on:
   workflow_call:
     inputs:
       provider:
-        description: Cargo binary name and artifact prefix
+        description: Cargo package and binary name, and artifact prefix
         required: true
         type: string
       name:
@@ -15,14 +15,25 @@ on:
         description: Provider namespace in the registry, such as carina-rs
         required: true
         type: string
-      wasm-toolchain:
-        description: Rust toolchain used for the WASM build
+      wasm-only:
+        description: Build only the WASM artifact and skip documentation
         required: false
-        default: stable
+        default: false
+        type: boolean
+      wasm-artifact-name:
+        description: WASM artifact name (empty uses {provider}-wasm)
+        required: false
+        default: ''
+        type: string
+      wasm-file-name:
+        description: WASM file name (empty uses {provider}-{GITHUB_REF_NAME}.wasm)
+        required: false
+        default: ''
         type: string
       docs-generate:
         description: Shell script that generates and verifies provider documentation
-        required: true
+        required: false
+        default: ''
         type: string
 
 permissions:
@@ -37,37 +48,69 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Read WASM toolchain
+        id: wasm-toolchain
+        run: |
+          if [[ ! -f .github/wasm-toolchain ]]; then
+            echo "::error file=.github/wasm-toolchain::Missing .github/wasm-toolchain; create it with a single exact Rust version (X.Y.Z), such as 1.95.0."
+            exit 1
+          fi
+          mapfile -t versions < .github/wasm-toolchain
+          if [[ ${#versions[@]} -ne 1 || ! ${versions[0]} =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error file=.github/wasm-toolchain::Expected a single exact Rust version (X.Y.Z), such as 1.95.0; stable, beta, and nightly are not supported."
+            exit 1
+          fi
+          printf 'toolchain=%s\n' "${versions[0]}" >> "$GITHUB_OUTPUT"
+          printf 'RUSTUP_TOOLCHAIN=%s\n' "${versions[0]}" >> "$GITHUB_ENV"
+
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: ${{ inputs.wasm-toolchain }}
+          toolchain: ${{ steps.wasm-toolchain.outputs.toolchain }}
           targets: wasm32-wasip2
+
+      - name: Verify WASM toolchain
+        env:
+          EXPECTED_TOOLCHAIN: ${{ steps.wasm-toolchain.outputs.toolchain }}
+        run: |
+          rustc_version=$(rustc -V)
+          printf '%s\n' "$rustc_version"
+          cargo -V
+          if [[ "$rustc_version" != "rustc ${EXPECTED_TOOLCHAIN} "* ]]; then
+            echo "::error::Expected rustc ${EXPECTED_TOOLCHAIN} from .github/wasm-toolchain; got ${rustc_version}."
+            exit 1
+          fi
 
       - name: Build
         env:
           PROVIDER: ${{ inputs.provider }}
-        run: cargo build --release --target wasm32-wasip2 --bin "$PROVIDER"
+        run: cargo build --locked --release --target wasm32-wasip2 -p "$PROVIDER"
 
       - name: Optimize WASM with vela
         env:
           PROVIDER: ${{ inputs.provider }}
         run: |
-          cargo install --git https://github.com/mizzy/vela --rev 4611418f8a84426b4b79077cae3f59357ca09ff7 vela-cli --quiet
+          cargo install --locked --git https://github.com/mizzy/vela --rev 4611418f8a84426b4b79077cae3f59357ca09ff7 vela-cli
           vela optimize "target/wasm32-wasip2/release/${PROVIDER}.wasm" -o "target/wasm32-wasip2/release/${PROVIDER}.wasm"
 
       - name: Package
+        id: package
         env:
           PROVIDER: ${{ inputs.provider }}
+          WASM_FILE_NAME: ${{ inputs.wasm-file-name || format('{0}-{1}.wasm', inputs.provider, github.ref_name) }}
         run: |
-          cp -- "target/wasm32-wasip2/release/${PROVIDER}.wasm" "${PROVIDER}-${GITHUB_REF_NAME}.wasm"
+          cp -- "target/wasm32-wasip2/release/${PROVIDER}.wasm" "$WASM_FILE_NAME"
+          printf 'path=%s\n' "$WASM_FILE_NAME" >> "$GITHUB_OUTPUT"
 
       - name: Upload artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: ${{ inputs.provider }}-wasm
-          path: ${{ inputs.provider }}-${{ github.ref_name }}.wasm
+          name: ${{ inputs.wasm-artifact-name || format('{0}-wasm', inputs.provider) }}
+          path: ${{ steps.package.outputs.path }}
+          overwrite: true
 
   build-docs:
     name: Build Docs Bundle
+    if: ${{ !inputs.wasm-only }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -83,6 +126,10 @@ jobs:
         env:
           DOCS_GENERATE: ${{ inputs.docs-generate }}
         run: |
+          if [[ -z "$DOCS_GENERATE" ]]; then
+            echo "::error::docs-generate is required when wasm-only is false."
+            exit 1
+          fi
           # This input is caller-supplied code by design. Materialize it without
           # expanding it in this shell, then run it with the same `bash -e`
           # behavior as a normal GitHub Actions `run:` step.

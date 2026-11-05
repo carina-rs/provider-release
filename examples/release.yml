@@ -17,8 +17,11 @@ jobs:
     name: Build
     if: github.event_name == 'push'
     # replace with a full commit SHA of carina-rs/provider-release
+    # Use the same SHA in CI and commit .github/wasm-toolchain with one exact
+    # Rust version (for example, 1.95.0); the workflow reads it after checkout.
     uses: carina-rs/provider-release/.github/workflows/build.yml@0000000000000000000000000000000000000000
     with:
+      # Omit wasm-only and the WASM naming inputs to keep release artifacts.
       provider: carina-provider-example
       name: example
       # Registry namespace that owns this provider.

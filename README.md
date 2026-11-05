@@ -23,7 +23,9 @@ The reusable build workflow therefore has no OIDC permission.
 
 The provider repository must:
 
-- expose a Cargo binary whose name is the `provider` input;
+- expose a Cargo package and binary whose names are the `provider` input;
+- commit `Cargo.lock` and a `.github/wasm-toolchain` file containing a single
+  exact Rust version, such as `1.95.0`, as described below;
 - copy
   [`scripts/docs-bundle.py`](https://github.com/carina-rs/carina-provider-aws/blob/main/scripts/docs-bundle.py),
   keep its `build <archive>` command, set `GENERATED_DOCS`
@@ -36,8 +38,8 @@ The provider repository must:
   pages by service for the docs sidebar; see the registry protocol,
   ["Documentation source: the docs bundle"](https://github.com/carina-rs/registry/blob/main/docs/protocol.md#documentation-source-the-docs-bundle).
   A bundle without it is shown with a flat Resources and Data Sources list;
-- provide `docs-generate`, which generates the docs and should fail when committed
-  generated files are stale;
+- provide `docs-generate` for release builds, which generates the docs and should
+  fail when committed generated files are stale;
 - define a GitHub environment named `release` and restrict it to `v*` tags; and
 - configure the provider's
   [trusted-publisher entry](https://github.com/carina-rs/registry/blob/main/docs/publish-api-design.md)
@@ -49,11 +51,67 @@ for yank. Dispatch yank with the `v<version>` tag selected as the workflow ref; 
 environment and the tag check reject branches. The `provider` value is also the
 artifact prefix, so the Cargo binary and release files use the same name.
 
+### WASM toolchain
+
+The caller repository's `.github/wasm-toolchain` is the only source of the WASM
+Rust toolchain version. Commit a single line containing an exact `X.Y.Z` version:
+
+```text
+1.95.0
+```
+
+Missing or empty files, multiple lines, channel names (`stable`, `beta`, or
+`nightly`), and other version formats fail with an error. There is no toolchain
+input or fallback. The WASM job exports this version as `RUSTUP_TOOLCHAIN`, so it
+takes precedence over the caller's toolchain files and rustup overrides. The
+workflow prints `rustc -V` and `cargo -V` and fails if rustc's version does not
+match the file. It builds the selected package with
+`cargo build --locked --release --target wasm32-wasip2 -p "$PROVIDER"`, then
+optimizes it with vela installed from its pinned revision using
+`cargo install --locked` and the same exact toolchain.
+
 ## Example
 
 Use [`examples/release.yml`](examples/release.yml) as the generic third-party
 caller template; replace its artifact prefix, registry name and namespace, the
 `docs-generate` script, and all-zero SHA.
+
+### CI
+
+Call the same build workflow from the provider's CI with `wasm-only: true` to skip
+the docs job. Pin CI and Release to the same provider-release commit so both use
+the same build command, toolchain file, and optimizer. The registry name and
+namespace inputs remain required for WASM-only calls.
+
+```yaml
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build-wasm:
+    # Use the same full commit SHA as the release workflow.
+    uses: carina-rs/provider-release/.github/workflows/build.yml@0000000000000000000000000000000000000000
+    with:
+      provider: carina-provider-example
+      name: example
+      namespace: your-namespace
+      wasm-only: true
+      wasm-artifact-name: provider-wasm
+      wasm-file-name: provider.wasm
+```
+
+The optional naming inputs let CI keep a fixed file name even when a branch name
+contains `/`. Release callers should omit these inputs to retain the names
+expected by the GitHub release and publish actions: artifact
+`${provider}-wasm`, containing `${provider}-${GITHUB_REF_NAME}.wasm`.
 
 ## Pinning
 
@@ -71,11 +129,13 @@ can also resolve in `uses:`. For example, use the GitHub compare view for
 
 | Input | Required | Default | Description |
 | --- | --- | --- | --- |
-| `provider` | yes | — | Cargo binary name and artifact prefix |
+| `provider` | yes | — | Cargo package and binary name, and artifact prefix |
 | `name` | yes | — | Registry provider name |
 | `namespace` | yes | — | Registry namespace |
-| `wasm-toolchain` | no | `stable` | Rust toolchain for the WASM build |
-| `docs-generate` | yes | — | Bash script that generates and verifies docs before bundling |
+| `wasm-only` | no | `false` | Skip the docs job and build only WASM |
+| `wasm-artifact-name` | no | `''` → `${provider}-wasm` | WASM upload artifact name |
+| `wasm-file-name` | no | `''` → `${provider}-${GITHUB_REF_NAME}.wasm` | Packaged WASM file name |
+| `docs-generate` | no | `''` | Bash script that generates and verifies docs; required when `wasm-only` is `false` |
 
 ### `github-release/action.yml`
 
