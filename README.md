@@ -51,6 +51,18 @@ for yank. Dispatch yank with the `v<version>` tag selected as the workflow ref; 
 environment and the tag check reject branches. The `provider` value is also the
 artifact prefix, so the Cargo binary and release files use the same name.
 
+### Re-runs
+
+Re-running only the failed publish job is safe if nobody has used "Re-run all jobs"
+first. Do not use "Re-run all jobs" for a tag: when rebuilt bytes differ, the
+workflow fails in Create Release by design and publish does not run. The tag's
+assets were uploaded from an earlier build and are never replaced. If the registry
+already has this version, nothing needs to be done; otherwise cut a new version.
+
+Callers must keep the `release-${{ github.ref }}` concurrency group from
+[`examples/release.yml`](examples/release.yml), because the asset check and upload
+are not atomic across concurrent runs for the same tag.
+
 ### WASM toolchain
 
 The caller repository's `.github/wasm-toolchain` is the only source of the WASM

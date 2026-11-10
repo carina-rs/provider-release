@@ -54,3 +54,7 @@ jobs:
       - name: Run registry request tests
         timeout-minutes: 5
         run: bash tests/registry-request.test.sh
+
+      - name: Run release asset tests
+        timeout-minutes: 5
+        run: bash tests/release-assets.test.sh
