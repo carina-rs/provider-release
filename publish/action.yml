@@ -75,8 +75,12 @@ runs:
         sign_blob "${PROVIDER}-${GITHUB_REF_NAME}.wasm" sigstore-bundle.json
 
     - name: Publish to Carina Registry
-      # If publishing fails, re-run only this failed job. Re-running the whole workflow
-      # rebuilds docs with a different digest, which the registry rejects with a 409.
+      # If publishing fails, re-running only this job is safe only if nobody has
+      # re-run the whole workflow first. "Re-run all jobs" rebuilds docs with a
+      # different digest and stops in the release job before uploading anything;
+      # publish does not run. Existing tag assets are never replaced. If the
+      # registry already has this version, nothing needs to be done; otherwise
+      # cut a new version.
       # If an attempt was interrupted after the registry recorded the artifact signature
       # but not the docs signature, the rerun gets 409 docs_signer_mismatch_recorded;
       # publish a new version instead.
